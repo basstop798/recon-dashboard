@@ -11,6 +11,8 @@ export const MODULE_IDS = [
   'archived',
   'tech',
   'js-endpoints',
+  'dns',
+  'meta',
 ] as const;
 
 export type ModuleId = (typeof MODULE_IDS)[number];
@@ -20,6 +22,8 @@ export const MODULE_LABELS: Record<ModuleId, string> = {
   archived: 'Archived URLs',
   tech: 'Technology Fingerprint',
   'js-endpoints': 'Static JS Endpoints',
+  dns: 'DNS Records',
+  meta: 'Recon Extras',
 };
 
 export const MODULE_DESCRIPTIONS: Record<ModuleId, string> = {
@@ -27,6 +31,8 @@ export const MODULE_DESCRIPTIONS: Record<ModuleId, string> = {
   archived: 'Wayback Machine CDX + Common Crawl index',
   tech: 'Single HTTP GET, response-header fingerprinting',
   'js-endpoints': 'Static parse of same-origin script references',
+  dns: 'A / AAAA / MX / TXT / NS / CNAME / SOA resolution',
+  meta: 'robots.txt, sitemap, security.txt, favicon hash',
 };
 
 /** Per-upstream outcome, so the UI can show which OSINT source degraded. */
@@ -85,12 +91,69 @@ export interface JsEndpointsPayload {
   truncated: boolean;
 }
 
+export interface DnsRecord {
+  type: string;
+  value: string;
+  /** MX only — lower wins. */
+  priority?: number;
+}
+
+export interface DnsPayload {
+  records: DnsRecord[];
+  /** One entry per record type queried. */
+  sources: SourceStat[];
+}
+
+export interface RobotsPayload {
+  found: boolean;
+  url: string;
+  disallowed: string[];
+  sitemaps: string[];
+}
+
+export interface SitemapPayload {
+  found: boolean;
+  /** Sitemap documents that actually resolved. */
+  documents: string[];
+  urls: string[];
+  truncated: boolean;
+}
+
+export interface SecurityTxtField {
+  name: string;
+  value: string;
+}
+
+export interface SecurityTxtPayload {
+  found: boolean;
+  url: string | null;
+  /** Ordered, duplicates preserved — multiple `Contact:` lines are normal. */
+  fields: SecurityTxtField[];
+}
+
+export interface FaviconPayload {
+  found: boolean;
+  url: string | null;
+  /** Shodan-compatible `http.favicon.hash` value (signed int32). */
+  hash: number | null;
+  bytes: number | null;
+}
+
+export interface MetaPayload {
+  robots: RobotsPayload;
+  sitemap: SitemapPayload;
+  securityTxt: SecurityTxtPayload;
+  favicon: FaviconPayload;
+}
+
 /** Maps each module to the shape it resolves with. */
 export interface ModulePayloads {
   subdomains: SubdomainsPayload;
   archived: ArchivedPayload;
   tech: TechPayload;
   'js-endpoints': JsEndpointsPayload;
+  dns: DnsPayload;
+  meta: MetaPayload;
 }
 
 /**

@@ -31,8 +31,10 @@ type TabId = ModuleId | 'dorks';
 const TABS: ReadonlyArray<{ id: TabId; label: string }> = [
   { id: 'subdomains', label: 'Subdomains' },
   { id: 'tech', label: 'Tech Stack' },
+  { id: 'dns', label: 'DNS Records' },
   { id: 'archived', label: 'Archived Endpoints' },
   { id: 'js-endpoints', label: 'JS Endpoints' },
+  { id: 'meta', label: 'Recon Extras' },
   { id: 'dorks', label: 'Dorks' },
 ];
 
@@ -125,6 +127,47 @@ function reportToText(report: ScanReport): string {
   lines.push(`[JS ENDPOINT CANDIDATES] (${js.data?.endpoints.length ?? 0})`);
   if (js.error) lines.push(`  ! ${js.error}`);
   for (const endpoint of js.data?.endpoints ?? []) lines.push(`  ${endpoint}`);
+  lines.push('');
+
+  const dns = report.modules.dns;
+  lines.push(`[DNS RECORDS] (${dns.data?.records.length ?? 0})`);
+  if (dns.error) lines.push(`  ! ${dns.error}`);
+  for (const record of dns.data?.records ?? []) {
+    const priority =
+      record.priority === undefined ? '' : ` priority=${record.priority}`;
+    lines.push(`  ${record.type.padEnd(6)} ${record.value}${priority}`);
+  }
+  lines.push('');
+
+  const extras = report.modules.meta;
+  lines.push('[RECON EXTRAS]');
+  if (extras.error) lines.push(`  ! ${extras.error}`);
+  if (extras.data) {
+    const { favicon, securityTxt, robots, sitemap } = extras.data;
+
+    lines.push(
+      `  Favicon      : ${
+        favicon.found
+          ? `${favicon.url} (http.favicon.hash:${favicon.hash}, ${favicon.bytes} bytes)`
+          : 'not retrieved'
+      }`,
+    );
+
+    lines.push(
+      `  security.txt : ${securityTxt.found ? securityTxt.url : 'not published'}`,
+    );
+    for (const field of securityTxt.fields) {
+      lines.push(`    ${field.name}: ${field.value}`);
+    }
+
+    lines.push(`  robots.txt   : ${robots.found ? robots.url : 'not published'}`);
+    for (const path of robots.disallowed) lines.push(`    Disallow: ${path}`);
+
+    lines.push(
+      `  Sitemap URLs : ${sitemap.urls.length} from ${sitemap.documents.length} document(s)`,
+    );
+    for (const url of sitemap.urls) lines.push(`    ${url}`);
+  }
   lines.push('');
 
   lines.push('[DORKS]');
@@ -376,6 +419,8 @@ export default function PassiveReconPage() {
   );
   const technologies = report?.modules.tech.data?.technologies ?? [];
   const jsEndpoints = report?.modules['js-endpoints'].data?.endpoints ?? [];
+  const dnsRecords = report?.modules.dns.data?.records ?? [];
+  const meta = report?.modules.meta.data ?? null;
 
   const filteredSubdomains = useMemo(() => {
     const needle = subdomainFilter.trim().toLowerCase();
@@ -394,6 +439,14 @@ export default function PassiveReconPage() {
     tech: technologies.length,
     archived: archivedUrls.length,
     'js-endpoints': jsEndpoints.length,
+    dns: dnsRecords.length,
+    // One aggregate count across the four independent extras.
+    meta: meta
+      ? (meta.favicon.found ? 1 : 0) +
+        meta.securityTxt.fields.length +
+        meta.robots.disallowed.length +
+        meta.sitemap.urls.length
+      : 0,
     dorks: report?.dorks.reduce((total, group) => total + group.dorks.length, 0) ?? 0,
   };
 
@@ -630,6 +683,42 @@ export default function PassiveReconPage() {
             </div>
           )}
 
+          {report && tab === 'dns' && (
+            <div>
+              <SourceStats sources={report.modules.dns.data?.sources ?? []} />
+              {dnsRecords.length === 0 ? (
+                <EmptyState state={report.modules.dns} label="DNS resolution" />
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead>
+                      <tr className="text-gray-500">
+                        <th className="py-2 pr-4 font-semibold">Type</th>
+                        <th className="py-2 pr-4 font-semibold">Value</th>
+                        <th className="py-2 font-semibold">Priority</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-800">
+                      {dnsRecords.slice(0, MAX_VISIBLE_ROWS).map((record, index) => (
+                        <tr key={`${record.type}-${record.value}-${index}`}>
+                          <td className="py-2 pr-4 align-top font-semibold text-emerald-400">
+                            {record.type}
+                          </td>
+                          <td className="py-2 pr-4 break-all text-gray-300">
+                            {record.value}
+                          </td>
+                          <td className="py-2 align-top text-gray-500">
+                            {record.priority ?? ''}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
+
           {report && tab === 'archived' && (
             <div>
               <SourceStats sources={report.modules.archived.data?.sources ?? []} />
@@ -692,6 +781,150 @@ export default function PassiveReconPage() {
                       </li>
                     ))}
                   </ul>
+                </>
+              )}
+            </div>
+          )}
+
+          {report && tab === 'meta' && (
+            <div className="space-y-8">
+              {!meta ? (
+                <EmptyState state={report.modules.meta} label="Recon extras" />
+              ) : (
+                <>
+                  <div>
+                    <h3 className="mb-3 text-sm font-semibold text-emerald-400">
+                      Favicon
+                    </h3>
+                    {meta.favicon.found && meta.favicon.url ? (
+                      <div className="flex items-center gap-4">
+                        {/* eslint-disable-next-line @next/next/no-img-element -- next/image needs a remotePatterns entry per host, and the scanned host is arbitrary and only known at scan time. */}
+                        <img
+                          src={meta.favicon.url}
+                          alt="Target favicon"
+                          width={32}
+                          height={32}
+                          className="h-8 w-8 shrink-0 rounded border border-gray-700 bg-gray-950 object-contain p-1"
+                        />
+                        <div className="min-w-0">
+                          <a
+                            href={meta.favicon.url}
+                            target="_blank"
+                            rel="noopener noreferrer nofollow"
+                            className="block truncate text-xs text-gray-400 hover:text-emerald-300 hover:underline"
+                          >
+                            {meta.favicon.url}
+                          </a>
+                          <div className="mt-1 flex flex-wrap items-center gap-2">
+                            <span className="rounded border border-emerald-800 bg-emerald-950/50 px-2 py-1 text-xs text-emerald-300">
+                              http.favicon.hash:{meta.favicon.hash}
+                            </span>
+                            <span className="text-xs text-gray-600">
+                              {meta.favicon.bytes} bytes
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+                    ) : (
+                      <p className="text-sm text-gray-500">No favicon retrieved.</p>
+                    )}
+                  </div>
+
+                  <div>
+                    <h3 className="mb-3 text-sm font-semibold text-emerald-400">
+                      security.txt
+                    </h3>
+                    {meta.securityTxt.found ? (
+                      <>
+                        <p className="mb-2 text-xs break-all text-gray-500">
+                          {meta.securityTxt.url}
+                        </p>
+                        <div className="overflow-x-auto">
+                          <table className="w-full text-left text-xs">
+                            <tbody className="divide-y divide-gray-800">
+                              {meta.securityTxt.fields.map((field, index) => (
+                                <tr key={`${field.name}-${index}`}>
+                                  <td className="py-2 pr-4 align-top font-semibold text-emerald-400">
+                                    {field.name}
+                                  </td>
+                                  <td className="py-2 break-all text-gray-300">
+                                    {field.value}
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </>
+                    ) : (
+                      <p className="text-sm text-gray-500">Not published.</p>
+                    )}
+                  </div>
+
+                  <div>
+                    <h3 className="mb-3 text-sm font-semibold text-emerald-400">
+                      robots.txt — disallowed paths
+                    </h3>
+                    {meta.robots.found && meta.robots.disallowed.length > 0 ? (
+                      <>
+                        <p className="mb-2 text-xs text-gray-500">
+                          Showing{' '}
+                          {Math.min(meta.robots.disallowed.length, MAX_VISIBLE_ROWS)} of{' '}
+                          {meta.robots.disallowed.length}
+                        </p>
+                        <ul className="divide-y divide-gray-800">
+                          {meta.robots.disallowed
+                            .slice(0, MAX_VISIBLE_ROWS)
+                            .map((path) => (
+                              <li
+                                key={path}
+                                className="py-2 text-sm break-all text-gray-300"
+                              >
+                                {path}
+                              </li>
+                            ))}
+                        </ul>
+                      </>
+                    ) : (
+                      <p className="text-sm text-gray-500">
+                        {meta.robots.found
+                          ? 'Published, but declares no disallowed paths.'
+                          : 'Not published.'}
+                      </p>
+                    )}
+                  </div>
+
+                  <div>
+                    <h3 className="mb-3 text-sm font-semibold text-emerald-400">
+                      Sitemap URLs
+                    </h3>
+                    {meta.sitemap.found && meta.sitemap.urls.length > 0 ? (
+                      <>
+                        <p className="mb-2 text-xs text-gray-500">
+                          Showing {Math.min(meta.sitemap.urls.length, MAX_VISIBLE_ROWS)}{' '}
+                          of {meta.sitemap.urls.length} from{' '}
+                          {meta.sitemap.documents.length} document(s)
+                          {meta.sitemap.truncated && ' — cap reached'}
+                        </p>
+                        <ul className="max-h-128 divide-y divide-gray-800 overflow-auto">
+                          {meta.sitemap.urls.slice(0, MAX_VISIBLE_ROWS).map((url) => (
+                            <li key={url} className="py-2 text-sm">
+                              <a
+                                href={url}
+                                target="_blank"
+                                rel="noopener noreferrer nofollow"
+                                className="break-all text-gray-300 hover:text-emerald-300 hover:underline"
+                              >
+                                {url}
+                              </a>
+                            </li>
+                          ))}
+                        </ul>
+                      </>
+                    ) : (
+                      <p className="text-sm text-gray-500">No sitemap URLs found.</p>
+                    )}
+                  </div>
                 </>
               )}
             </div>

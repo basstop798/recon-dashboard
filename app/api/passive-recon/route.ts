@@ -21,16 +21,29 @@ import type { NextRequest } from 'next/server';
 import { sanitizeDomain } from '@/lib/passive-recon/sanitize';
 import { assertPublicHost } from '@/lib/passive-recon/net-guard';
 import { extractEndpoints, extractScriptUrls } from '@/lib/passive-recon/js-parser';
+import { collectDnsRecords } from '@/lib/passive-recon/dns-records';
+import {
+  parseRobotsTxt,
+  parseSecurityTxt,
+  parseSitemapLocs,
+  resolveFaviconUrl,
+  shodanFaviconHash,
+} from '@/lib/passive-recon/recon-extras';
 import {
   MODULE_IDS,
   type ArchivedPayload,
   type Confidence,
+  type FaviconPayload,
   type HeaderRecord,
   type JsEndpointsPayload,
+  type MetaPayload,
   type ModuleDoneEvent,
   type ModuleId,
   type ModulePayloads,
+  type RobotsPayload,
   type ScanEvent,
+  type SecurityTxtPayload,
+  type SitemapPayload,
   type SourceStat,
   type SubdomainRecord,
   type SubdomainsPayload,
@@ -50,6 +63,7 @@ const TIMEOUTS = {
   osint: 15_000,
   target: 10_000,
   script: 8_000,
+  meta: 8_000,
 } as const;
 
 const LIMITS = {
@@ -61,6 +75,13 @@ const LIMITS = {
   htmlBytes: 1_000_000,
   scriptBytes: 1_500_000,
   osintBytes: 8_000_000,
+  robotsBytes: 100_000,
+  securityTxtBytes: 20_000,
+  sitemapBytes: 2_000_000,
+  /** Sitemap documents followed per scan (an index can name hundreds). */
+  sitemapDocs: 3,
+  sitemapUrls: 1_000,
+  faviconBytes: 300_000,
 } as const;
 
 /* -------------------------------------------------------------------------- */
@@ -113,6 +134,45 @@ async function readCapped(response: Response, maxBytes: number): Promise<string>
   return out;
 }
 
+/** Byte-capped variant of `readCapped` for responses that are not text. */
+async function readCappedBytes(
+  response: Response,
+  maxBytes: number,
+): Promise<Uint8Array> {
+  if (!response.body) return new Uint8Array(0);
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+
+      if (total + value.byteLength > maxBytes) {
+        chunks.push(value.subarray(0, maxBytes - total));
+        total = maxBytes;
+        break;
+      }
+
+      chunks.push(value);
+      total += value.byteLength;
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
 interface FetchOptions {
   parentSignal: AbortSignal;
   timeoutMs: number;
@@ -120,15 +180,16 @@ interface FetchOptions {
   accept?: string;
 }
 
-async function fetchText(
+/** The shared request itself; callers decide how to drain the body. */
+async function performFetch(
   url: string,
-  { parentSignal, timeoutMs, maxBytes, accept }: FetchOptions,
-): Promise<{ response: Response; text: string }> {
+  { parentSignal, timeoutMs, accept }: FetchOptions,
+): Promise<Response> {
   // Either the client hanging up or our own deadline cancels the request, so a
   // stalled upstream can never pin the connection open.
   const signal = AbortSignal.any([parentSignal, AbortSignal.timeout(timeoutMs)]);
 
-  const response = await fetch(url, {
+  return fetch(url, {
     method: 'GET',
     redirect: 'follow',
     signal,
@@ -139,8 +200,22 @@ async function fetchText(
       'Accept-Language': 'en-US,en;q=0.9',
     },
   });
+}
 
-  return { response, text: await readCapped(response, maxBytes) };
+async function fetchText(
+  url: string,
+  options: FetchOptions,
+): Promise<{ response: Response; text: string }> {
+  const response = await performFetch(url, options);
+  return { response, text: await readCapped(response, options.maxBytes) };
+}
+
+async function fetchBytes(
+  url: string,
+  options: FetchOptions,
+): Promise<{ response: Response; bytes: Uint8Array }> {
+  const response = await performFetch(url, options);
+  return { response, bytes: await readCappedBytes(response, options.maxBytes) };
 }
 
 /** Runs named sources concurrently, converting rejections into `SourceStat`s. */
@@ -657,6 +732,210 @@ async function collectJsEndpoints(
 }
 
 /* -------------------------------------------------------------------------- */
+/* Module 5 — recon extras (robots.txt, sitemap, security.txt, favicon)       */
+/* -------------------------------------------------------------------------- */
+
+async function fetchRobotsTxt(
+  domain: string,
+  parentSignal: AbortSignal,
+): Promise<RobotsPayload> {
+  const url = `https://${domain}/robots.txt`;
+  const missing: RobotsPayload = { found: false, url, disallowed: [], sitemaps: [] };
+
+  try {
+    const { response, text } = await fetchText(url, {
+      parentSignal,
+      timeoutMs: TIMEOUTS.meta,
+      maxBytes: LIMITS.robotsBytes,
+      accept: 'text/plain,*/*;q=0.8',
+    });
+
+    // Not publishing robots.txt is normal, so a 404 is a result, not a failure.
+    if (!response.ok) return missing;
+
+    return { found: true, url, ...parseRobotsTxt(text) };
+  } catch {
+    return missing;
+  }
+}
+
+/**
+ * Keeps only sitemap URLs that stay on the target site.
+ *
+ * robots.txt is target-controlled content: a hostile host could declare
+ * `Sitemap: http://169.254.169.254/...` and turn this module into an SSRF
+ * primitive. Restricting to the target's own site mirrors the same-origin rule
+ * `js-parser.ts` already applies to script references — and a sitemap hosted
+ * somewhere else is not the target's sitemap anyway.
+ */
+function sameSiteSitemaps(declared: string[], domain: string): string[] {
+  const out: string[] = [];
+
+  for (const raw of declared) {
+    try {
+      const parsed = new URL(raw);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') continue;
+      if (parsed.hostname !== domain && !parsed.hostname.endsWith(`.${domain}`)) {
+        continue;
+      }
+      out.push(parsed.toString());
+    } catch {
+      continue;
+    }
+  }
+
+  return out;
+}
+
+async function fetchSitemap(
+  domain: string,
+  declared: string[],
+  parentSignal: AbortSignal,
+): Promise<SitemapPayload> {
+  const candidates = [
+    ...new Set([...declared, `https://${domain}/sitemap.xml`]),
+  ].slice(0, LIMITS.sitemapDocs);
+
+  const settled = await Promise.allSettled(
+    candidates.map(async (url) => {
+      const { response, text } = await fetchText(url, {
+        parentSignal,
+        timeoutMs: TIMEOUTS.meta,
+        maxBytes: LIMITS.sitemapBytes,
+        accept: 'application/xml,text/xml,*/*;q=0.8',
+      });
+
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return { url, locs: parseSitemapLocs(text) };
+    }),
+  );
+
+  const documents: string[] = [];
+  const urls = new Set<string>();
+
+  for (const outcome of settled) {
+    if (outcome.status !== 'fulfilled') continue;
+    documents.push(outcome.value.url);
+    for (const loc of outcome.value.locs) urls.add(loc);
+  }
+
+  const all = [...urls].sort();
+
+  return {
+    found: documents.length > 0,
+    documents,
+    urls: all.slice(0, LIMITS.sitemapUrls),
+    truncated: all.length > LIMITS.sitemapUrls,
+  };
+}
+
+async function fetchSecurityTxt(
+  domain: string,
+  parentSignal: AbortSignal,
+): Promise<SecurityTxtPayload> {
+  // RFC 9116 makes /.well-known/ authoritative; the bare path is a legacy
+  // location still seen in the wild.
+  const candidates = [
+    `https://${domain}/.well-known/security.txt`,
+    `https://${domain}/security.txt`,
+  ];
+
+  for (const url of candidates) {
+    try {
+      const { response, text } = await fetchText(url, {
+        parentSignal,
+        timeoutMs: TIMEOUTS.meta,
+        maxBytes: LIMITS.securityTxtBytes,
+        accept: 'text/plain,*/*;q=0.8',
+      });
+
+      if (!response.ok) continue;
+
+      const fields = parseSecurityTxt(text);
+      // A soft-404 HTML page yields no parsable fields; treat that as absent.
+      if (fields.length === 0) continue;
+
+      return { found: true, url, fields };
+    } catch {
+      continue;
+    }
+  }
+
+  return { found: false, url: null, fields: [] };
+}
+
+async function fetchFavicon(
+  homepage: HomepageResult,
+  parentSignal: AbortSignal,
+): Promise<FaviconPayload> {
+  const missing: FaviconPayload = {
+    found: false,
+    url: null,
+    hash: null,
+    bytes: null,
+  };
+
+  if (!homepage.ok) return missing;
+
+  const url = resolveFaviconUrl(homepage.html, homepage.finalUrl);
+  if (!url) return missing;
+
+  try {
+    // The href comes from target-controlled markup and may name any host, so it
+    // gets the same public-address check as the target. Refusing off-site icons
+    // outright would be wrong — large sites legitimately serve favicons from a
+    // CDN, and that icon is still the one Shodan indexed.
+    const guard = await assertPublicHost(new URL(url).hostname);
+    if (!guard.ok) return { ...missing, url };
+
+    const { response, bytes } = await fetchBytes(url, {
+      parentSignal,
+      timeoutMs: TIMEOUTS.meta,
+      maxBytes: LIMITS.faviconBytes,
+      accept: 'image/*,*/*;q=0.8',
+    });
+
+    if (!response.ok || bytes.length === 0) return { ...missing, url };
+
+    return {
+      found: true,
+      url,
+      hash: shodanFaviconHash(bytes),
+      bytes: bytes.length,
+    };
+  } catch {
+    return { ...missing, url };
+  }
+}
+
+/**
+ * Best-effort metadata sweep.
+ *
+ * Every sub-fetch absorbs its own failure into a `found: false` result, so this
+ * never throws and the module always reports a partial. A target that publishes
+ * no security.txt is a normal finding, not a broken scan.
+ */
+async function collectMeta(
+  domain: string,
+  homepage: Promise<HomepageResult>,
+  parentSignal: AbortSignal,
+): Promise<MetaPayload> {
+  // Reuses the one shared homepage request rather than fetching the page again.
+  const page = await homepage;
+
+  // robots.txt runs first because it declares the sitemaps the next step reads.
+  const robots = await fetchRobotsTxt(domain, parentSignal);
+
+  const [sitemap, securityTxt, favicon] = await Promise.all([
+    fetchSitemap(domain, sameSiteSitemaps(robots.sitemaps, domain), parentSignal),
+    fetchSecurityTxt(domain, parentSignal),
+    fetchFavicon(page, parentSignal),
+  ]);
+
+  return { robots, sitemap, securityTxt, favicon };
+}
+
+/* -------------------------------------------------------------------------- */
 /* Route handler                                                              */
 /* -------------------------------------------------------------------------- */
 
@@ -753,6 +1032,8 @@ export async function POST(request: NextRequest): Promise<Response> {
           run('js-endpoints', () =>
             collectJsEndpoints(domain, homepage, request.signal),
           ),
+          run('dns', () => collectDnsRecords(domain)),
+          run('meta', () => collectMeta(domain, homepage, request.signal)),
         ]);
 
         send({
