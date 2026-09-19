@@ -8,7 +8,9 @@
 
 import { Resolver } from 'node:dns/promises';
 
-import type { DnsPayload, DnsRecord, SourceStat } from './types';
+import { classifyResolution } from './takeover';
+import { cymruOriginQuery, parseCymruAsName, parseCymruOrigin } from './whois-intel';
+import { NULL_MX, type DnsPayload, type DnsRecord, type HostResolution, type SourceStat } from './types';
 
 /**
  * Comma-separated resolver IPs, e.g. `PASSIVE_RECON_DNS_SERVERS=1.1.1.1,8.8.8.8`.
@@ -119,7 +121,9 @@ const QUERIES: readonly QuerySpec[] = [
     run: async (resolver, domain) =>
       (await resolver.resolveMx(domain)).map((record) => ({
         type: 'MX',
-        value: record.exchange,
+        // RFC 7505 lets a domain publish `MX 0 .` to declare that it handles no
+        // mail at all; c-ares reports that root label as an empty exchange.
+        value: record.exchange || NULL_MX,
         priority: record.priority,
       })),
   },
@@ -145,6 +149,19 @@ const QUERIES: readonly QuerySpec[] = [
         type: 'CNAME',
         value,
       })),
+  },
+  {
+    type: 'CAA',
+    run: async (resolver, domain) =>
+      // CAA names which CAs may issue for the domain. Its absence is itself a
+      // finding: any public CA will issue without one.
+      (await resolver.resolveCaa(domain)).map((record) => {
+        const [tag, value] = Object.entries(record).find(([key]) => key !== 'critical') ?? [];
+        return {
+          type: 'CAA',
+          value: `${tag ?? '?'} "${String(value ?? '')}"`,
+        };
+      }),
   },
   {
     type: 'SOA',
@@ -217,4 +234,192 @@ export async function collectDnsRecords(domain: string): Promise<DnsPayload> {
   );
 
   return { records, sources };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Targeted lookups                                                           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * TXT records for an arbitrary name (`_dmarc.example.com`, a DKIM selector…).
+ *
+ * Returns `[]` rather than throwing when the name simply has no TXT record,
+ * because "not published" is the answer the caller is asking about.
+ */
+export async function resolveTxtFor(name: string): Promise<string[]> {
+  const resolver = createResolver();
+
+  try {
+    const chunks = await withTimeout(() => resolver.resolveTxt(name), `TXT ${name}`);
+    return chunks.map((parts) => parts.join(''));
+  } catch {
+    return [];
+  }
+}
+
+/** CAA records as `tag "value"` strings, or `[]` when none are published. */
+export async function resolveCaaFor(domain: string): Promise<string[]> {
+  const resolver = createResolver();
+
+  try {
+    const records = await withTimeout(() => resolver.resolveCaa(domain), `CAA ${domain}`);
+    return records.map((record) => {
+      const [tag, value] = Object.entries(record).find(([key]) => key !== 'critical') ?? [];
+      return `${tag ?? '?'} "${String(value ?? '')}"`;
+    });
+  } catch {
+    return [];
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Host sweep (subdomain takeover detection)                                  */
+/* -------------------------------------------------------------------------- */
+
+/** Parallel resolutions in flight. High enough to be quick, low enough to be polite. */
+const SWEEP_CONCURRENCY = 16;
+
+async function resolveOne(resolver: Resolver, host: string): Promise<HostResolution> {
+  let cname: string | null = null;
+  let addresses: string[] = [];
+  let errored = false;
+
+  try {
+    cname = (await withTimeout(() => resolver.resolveCname(host), `CNAME ${host}`))[0] ?? null;
+  } catch (error) {
+    // ENODATA just means "no CNAME at this name", which is the common case.
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code && !EMPTY_RESULT_CODES.has(code)) errored = true;
+  }
+
+  try {
+    addresses = await withTimeout(() => resolver.resolve4(host), `A ${host}`);
+  } catch {
+    try {
+      addresses = await withTimeout(() => resolver.resolve6(host), `AAAA ${host}`);
+    } catch {
+      addresses = [];
+    }
+  }
+
+  const classification = classifyResolution({
+    host,
+    addresses,
+    cname,
+    // A recursive resolver follows the CNAME chain for us: an address means the
+    // chain terminates somewhere real, and no address with a CNAME present
+    // means the target of that CNAME is gone.
+    resolves: addresses.length > 0,
+  });
+
+  return {
+    host,
+    addresses,
+    cname,
+    ...classification,
+    ...(errored && addresses.length === 0 && !cname
+      ? { status: 'error' as const, note: 'Resolution failed.' }
+      : {}),
+  };
+}
+
+/**
+ * Resolves discovered hosts and fingerprints their CNAMEs for takeover.
+ *
+ * Passivity note: these are ordinary recursive lookups — the same ones a
+ * browser performs before it opens any connection — so nothing is sent to the
+ * target's web servers. The target's *authoritative* nameservers may answer via
+ * the recursive resolver, exactly as they do for any visitor. The sweep is
+ * capped and concurrency-limited so it stays indistinguishable from normal
+ * traffic.
+ */
+export async function sweepHosts(
+  hosts: readonly string[],
+  limit: number,
+): Promise<HostResolution[]> {
+  const resolver = createResolver();
+  const queue = hosts.slice(0, limit);
+  const results: HostResolution[] = [];
+  let cursor = 0;
+
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= queue.length) return;
+
+      try {
+        results.push(await resolveOne(resolver, queue[index]));
+      } catch {
+        results.push({
+          host: queue[index],
+          addresses: [],
+          cname: null,
+          service: null,
+          status: 'error',
+          takeover: false,
+          severity: 'info',
+          note: 'Resolution failed.',
+        });
+      }
+    }
+  };
+
+  await Promise.all(
+    Array.from({ length: Math.min(SWEEP_CONCURRENCY, queue.length) }, worker),
+  );
+
+  // Interesting first: takeover candidates, then dangling, then the rest.
+  const rank = (host: HostResolution): number =>
+    host.takeover ? 0 : host.status === 'dangling' ? 1 : host.status === 'live' ? 2 : 3;
+
+  return results.sort((a, b) => rank(a) - rank(b) || a.host.localeCompare(b.host));
+}
+
+/* -------------------------------------------------------------------------- */
+/* ASN lookup (Team Cymru, over DNS)                                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Looks up the origin AS for an IPv4 address using Team Cymru's TXT service.
+ *
+ * DNS rather than an HTTP API on purpose: no key, no rate-limit headers, and
+ * the query joins the same resolver traffic every other lookup uses.
+ */
+export async function lookupAsn(
+  ip: string,
+): Promise<{ asn: string | null; prefix: string | null; country: string | null; asnName: string | null }> {
+  const empty = { asn: null, prefix: null, country: null, asnName: null };
+
+  const query = cymruOriginQuery(ip);
+  if (!query) return empty;
+
+  const resolver = createResolver();
+
+  let origin: string;
+  try {
+    const records = await withTimeout(() => resolver.resolveTxt(query), `ASN ${ip}`);
+    origin = records[0]?.join('') ?? '';
+  } catch {
+    return empty;
+  }
+
+  if (!origin) return empty;
+
+  const parsed = parseCymruOrigin(origin, ip);
+  let asnName: string | null = null;
+
+  if (parsed.asn) {
+    try {
+      const records = await withTimeout(
+        () => resolver.resolveTxt(`AS${parsed.asn}.asn.cymru.com`),
+        `AS name ${parsed.asn}`,
+      );
+      asnName = parseCymruAsName(records[0]?.join('') ?? '');
+    } catch {
+      // The origin lookup is the useful half; a missing name is cosmetic.
+    }
+  }
+
+  return { asn: parsed.asn, prefix: parsed.prefix, country: parsed.country, asnName };
 }
