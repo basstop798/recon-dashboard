@@ -8,20 +8,57 @@
  * upstream settles would make the progress indicators cosmetic. Each module
  * therefore emits `module_start` / `module_done` | `module_error` as it lands.
  *
- * Passivity contract — this route performs **no** active probing. There is no
- * port scanning, no directory brute-forcing and no shell execution. Third-party
- * OSINT indexes are queried for data they already hold, and the target itself
- * receives exactly one ordinary GET of its homepage (plus up to
- * `LIMITS.scripts` same-origin `<script src>` files it advertises), which is
- * indistinguishable from a single browser visit.
+ * ── Passivity contract ────────────────────────────────────────────────────────
+ * There is no port scanning, no directory brute-forcing, no parameter fuzzing
+ * and no shell execution anywhere in this route. Concretely, one scan means:
+ *
+ *   • Third-party OSINT indexes are queried for data they already hold.
+ *   • DNS resolution — apex records, plus a capped sweep of discovered hosts.
+ *     These are ordinary recursive lookups; nothing reaches the target's web
+ *     servers, and the target's authoritative nameservers see the same queries
+ *     any visitor's resolver generates.
+ *   • The target itself receives ONE homepage GET, up to `LIMITS.scripts`
+ *     same-origin `<script src>` files it advertises, and a fixed, short list
+ *     of standardised public files (robots.txt, sitemap, security.txt, favicon,
+ *     `/.well-known/*`, ads.txt, humans.txt). That is a browser's first visit —
+ *     a bounded, published set, never a wordlist.
+ *
+ * Anything that would put unauthorised traffic on the target belongs in the
+ * operator's own tooling, which is why the dashboard exports wordlists instead
+ * of firing them.
  */
 
 import type { NextRequest } from 'next/server';
 
 import { sanitizeDomain } from '@/lib/passive-recon/sanitize';
 import { assertPublicHost } from '@/lib/passive-recon/net-guard';
-import { extractEndpoints, extractScriptUrls } from '@/lib/passive-recon/js-parser';
-import { collectDnsRecords } from '@/lib/passive-recon/dns-records';
+import {
+  extractEndpoints,
+  extractHosts,
+  extractInlineScripts,
+  extractScriptUrls,
+} from '@/lib/passive-recon/js-parser';
+import {
+  collectDnsRecords,
+  lookupAsn,
+  resolveCaaFor,
+  resolveTxtFor,
+  sweepHosts,
+} from '@/lib/passive-recon/dns-records';
+import {
+  auditSecurityHeaders,
+  parsePageIdentity,
+  readCookies,
+} from '@/lib/passive-recon/headers-audit';
+import {
+  COMMON_DKIM_SELECTORS,
+  parseDkimKey,
+  parseDmarc,
+  parseSpf,
+} from '@/lib/passive-recon/mail-security';
+import { extractSourceMaps, scanSecrets } from '@/lib/passive-recon/secrets';
+import { analyzeUrls } from '@/lib/passive-recon/url-intel';
+import { EMPTY_WHOIS, parseRdapDomain } from '@/lib/passive-recon/whois-intel';
 import {
   parseRobotsTxt,
   parseSecurityTxt,
@@ -36,53 +73,82 @@ import {
   type FaviconPayload,
   type HeaderRecord,
   type JsEndpointsPayload,
+  type MailPayload,
   type MetaPayload,
   type ModuleDoneEvent,
   type ModuleId,
   type ModulePayloads,
   type RobotsPayload,
   type ScanEvent,
+  type SecretMatch,
   type SecurityTxtPayload,
   type SitemapPayload,
   type SourceStat,
   type SubdomainRecord,
   type SubdomainsPayload,
+  type TakeoverPayload,
   type TechPayload,
   type Technology,
+  type UrlIntelPayload,
+  type WellKnownFile,
+  type WhoisPayload,
 } from '@/lib/passive-recon/types';
 
 // `node:dns` in the SSRF guard requires the Node runtime, not Edge.
 export const runtime = 'nodejs';
 // Allows the slowest OSINT index to finish on platforms that cap execution.
-export const maxDuration = 60;
+export const maxDuration = 120;
 
 const USER_AGENT =
-  'Mozilla/5.0 (compatible; PassiveReconDashboard/1.0; +passive-osint)';
+  'Mozilla/5.0 (compatible; PassiveReconDashboard/2.0; +passive-osint)';
 
 const TIMEOUTS = {
-  osint: 15_000,
-  target: 10_000,
-  script: 8_000,
+  osint: 20_000,
+  target: 12_000,
+  script: 10_000,
   meta: 8_000,
+  rdap: 12_000,
 } as const;
 
 const LIMITS = {
-  subdomains: 2_000,
-  archivedUrls: 3_000,
+  subdomains: 5_000,
+  archivedUrls: 5_000,
   /** Same-origin bundles fetched per scan — kept low to stay polite. */
-  scripts: 6,
-  endpoints: 500,
-  htmlBytes: 1_000_000,
-  scriptBytes: 1_500_000,
-  osintBytes: 8_000_000,
-  robotsBytes: 100_000,
+  scripts: 12,
+  endpoints: 1_000,
+  secrets: 200,
+  /** Discovered hosts put through the resolution/takeover sweep. */
+  resolveHosts: 250,
+  /** IPs sent to the ASN lookup. */
+  asnLookups: 4,
+  htmlBytes: 1_500_000,
+  scriptBytes: 3_000_000,
+  osintBytes: 12_000_000,
+  robotsBytes: 200_000,
   securityTxtBytes: 20_000,
-  sitemapBytes: 2_000_000,
+  sitemapBytes: 3_000_000,
   /** Sitemap documents followed per scan (an index can name hundreds). */
-  sitemapDocs: 3,
-  sitemapUrls: 1_000,
+  sitemapDocs: 5,
+  sitemapUrls: 3_000,
   faviconBytes: 300_000,
+  wellKnownBytes: 60_000,
+  wellKnownPreview: 400,
 } as const;
+
+/**
+ * Standardised, publicly advertised files. Fixed list, never generated — this
+ * is metadata discovery, not content brute-forcing (see the contract above).
+ */
+const WELL_KNOWN_PATHS = [
+  '/.well-known/openid-configuration',
+  '/.well-known/assetlinks.json',
+  '/.well-known/apple-app-site-association',
+  '/.well-known/change-password',
+  '/.well-known/nodeinfo',
+  '/ads.txt',
+  '/humans.txt',
+  '/crossdomain.xml',
+] as const;
 
 /* -------------------------------------------------------------------------- */
 /* Fetch plumbing                                                             */
@@ -218,6 +284,24 @@ async function fetchBytes(
   return { response, bytes: await readCappedBytes(response, options.maxBytes) };
 }
 
+/** Fetches JSON with the byte cap intact, and a clear error when it is not JSON. */
+async function fetchJson<T>(
+  url: string,
+  options: FetchOptions,
+  label: string,
+): Promise<T> {
+  const { response, text } = await fetchText(url, { ...options, accept: 'application/json' });
+
+  if (!response.ok) throw new Error(`${label} responded ${response.status}.`);
+  if (text.trim().length === 0) throw new Error(`${label} returned an empty body.`);
+
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new Error(`${label} returned a non-JSON body (commonly a rate limit).`);
+  }
+}
+
 /** Runs named sources concurrently, converting rejections into `SourceStat`s. */
 async function runSources(
   sources: ReadonlyArray<{ name: string; run: () => Promise<string[]> }>,
@@ -246,6 +330,34 @@ async function runSources(
   });
 
   return { results, stats };
+}
+
+/**
+ * Wraps a shared promise so several modules can await it safely.
+ *
+ * A rejected promise with more than one consumer surfaces as an unhandled
+ * rejection for whichever consumer attached second, so the rejection is folded
+ * into the value and re-thrown per consumer by `unwrap`.
+ */
+type Settled<T> = { ok: true; value: T } | { ok: false; error: string };
+
+function share<T>(promise: Promise<T>): Promise<Settled<T>> {
+  return promise.then(
+    (value) => ({ ok: true, value }) as const,
+    (error: unknown) => ({ ok: false, error: toMessage(error) }) as const,
+  );
+}
+
+async function unwrap<T>(settled: Promise<Settled<T>>): Promise<T> {
+  const result = await settled;
+  if (!result.ok) throw new Error(result.error);
+  return result.value;
+}
+
+/** Awaits a shared promise, substituting a default when it failed. */
+async function unwrapOr<T>(settled: Promise<Settled<T>>, fallback: T): Promise<T> {
+  const result = await settled;
+  return result.ok ? result.value : fallback;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -287,23 +399,11 @@ async function fetchHackerTarget(
 async function fetchCrtSh(domain: string, parentSignal: AbortSignal): Promise<string[]> {
   // `%25` is a literal '%' — crt.sh's SQL-style wildcard for "any subdomain".
   const url = `https://crt.sh/?q=%25.${encodeURIComponent(domain)}&output=json`;
-  const { response, text } = await fetchText(url, {
-    parentSignal,
-    timeoutMs: TIMEOUTS.osint,
-    maxBytes: LIMITS.osintBytes,
-    accept: 'application/json',
-  });
-
-  if (!response.ok) {
-    throw new Error(`crt.sh responded ${response.status}.`);
-  }
-
-  let rows: Array<{ name_value?: string; common_name?: string }>;
-  try {
-    rows = JSON.parse(text);
-  } catch {
-    throw new Error('crt.sh returned a non-JSON body (commonly a rate limit).');
-  }
+  const rows = await fetchJson<Array<{ name_value?: string; common_name?: string }>>(
+    url,
+    { parentSignal, timeoutMs: TIMEOUTS.osint, maxBytes: LIMITS.osintBytes },
+    'crt.sh',
+  );
 
   const hosts = new Set<string>();
 
@@ -321,13 +421,125 @@ async function fetchCrtSh(domain: string, parentSignal: AbortSignal): Promise<st
   return [...hosts];
 }
 
+/**
+ * SSLMate's Cert Spotter — a second, independently operated CT feed.
+ *
+ * crt.sh is the community default and is also the one that rate-limits first,
+ * so a scan that depends on it alone loses certificate transparency entirely on
+ * a bad day.
+ */
+async function fetchCertSpotter(
+  domain: string,
+  parentSignal: AbortSignal,
+): Promise<string[]> {
+  const url =
+    'https://api.certspotter.com/v1/issuances' +
+    `?domain=${encodeURIComponent(domain)}` +
+    '&include_subdomains=true&expand=dns_names';
+
+  const rows = await fetchJson<Array<{ dns_names?: string[] }>>(
+    url,
+    { parentSignal, timeoutMs: TIMEOUTS.osint, maxBytes: LIMITS.osintBytes },
+    'Cert Spotter',
+  );
+
+  const hosts = new Set<string>();
+  for (const row of rows) {
+    for (const name of row.dns_names ?? []) {
+      const host = normalizeHost(name);
+      if (host && isInScope(host, domain)) hosts.add(host);
+    }
+  }
+  return [...hosts];
+}
+
+/** AlienVault OTX passive DNS — hosts observed resolving, not just certificated. */
+async function fetchOtxSubdomains(
+  domain: string,
+  parentSignal: AbortSignal,
+): Promise<string[]> {
+  const url = `https://otx.alienvault.com/api/v1/indicators/domain/${encodeURIComponent(
+    domain,
+  )}/passive_dns`;
+
+  const payload = await fetchJson<{ passive_dns?: Array<{ hostname?: string }> }>(
+    url,
+    { parentSignal, timeoutMs: TIMEOUTS.osint, maxBytes: LIMITS.osintBytes },
+    'AlienVault OTX',
+  );
+
+  const hosts = new Set<string>();
+  for (const row of payload.passive_dns ?? []) {
+    const host = normalizeHost(row.hostname ?? '');
+    if (host && isInScope(host, domain)) hosts.add(host);
+  }
+  return [...hosts];
+}
+
+/** JonLuca's Anubis DB — an aggregate of several enumeration runs. */
+async function fetchAnubis(domain: string, parentSignal: AbortSignal): Promise<string[]> {
+  const url = `https://jldc.me/anubis/subdomains/${encodeURIComponent(domain)}`;
+  const rows = await fetchJson<string[]>(
+    url,
+    { parentSignal, timeoutMs: TIMEOUTS.osint, maxBytes: LIMITS.osintBytes },
+    'Anubis',
+  );
+
+  const hosts = new Set<string>();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const host = normalizeHost(String(row));
+    if (host && isInScope(host, domain)) hosts.add(host);
+  }
+  return [...hosts];
+}
+
+interface UrlscanResult {
+  page?: { domain?: string; url?: string };
+  task?: { domain?: string; url?: string };
+}
+
+/** urlscan.io submissions — hosts and URLs somebody already loaded in a browser. */
+async function fetchUrlscan(
+  domain: string,
+  parentSignal: AbortSignal,
+): Promise<UrlscanResult[]> {
+  const url = `https://urlscan.io/api/v1/search/?q=domain%3A${encodeURIComponent(
+    domain,
+  )}&size=1000`;
+
+  const payload = await fetchJson<{ results?: UrlscanResult[] }>(
+    url,
+    { parentSignal, timeoutMs: TIMEOUTS.osint, maxBytes: LIMITS.osintBytes },
+    'urlscan.io',
+  );
+
+  return payload.results ?? [];
+}
+
 async function collectSubdomains(
   domain: string,
   parentSignal: AbortSignal,
 ): Promise<SubdomainsPayload> {
   const { results, stats } = await runSources([
-    { name: 'HackerTarget', run: () => fetchHackerTarget(domain, parentSignal) },
     { name: 'crt.sh', run: () => fetchCrtSh(domain, parentSignal) },
+    { name: 'Cert Spotter', run: () => fetchCertSpotter(domain, parentSignal) },
+    { name: 'HackerTarget', run: () => fetchHackerTarget(domain, parentSignal) },
+    { name: 'AlienVault OTX', run: () => fetchOtxSubdomains(domain, parentSignal) },
+    { name: 'Anubis', run: () => fetchAnubis(domain, parentSignal) },
+    {
+      name: 'urlscan.io',
+      run: async () => {
+        const rows = await fetchUrlscan(domain, parentSignal);
+        const hosts = new Set<string>();
+        for (const row of rows) {
+          for (const candidate of [row.page?.domain, row.task?.domain]) {
+            const host = normalizeHost(candidate ?? '');
+            if (host && isInScope(host, domain)) hosts.add(host);
+          }
+        }
+        return [...hosts];
+      },
+    },
   ]);
 
   // Track which sources reported each host — agreement across independent
@@ -342,16 +554,17 @@ async function collectSubdomains(
     }
   }
 
-  const subdomains: SubdomainRecord[] = [...merged.entries()]
+  const all = [...merged.entries()]
     .map(([host, sources]) => ({ host, sources: [...sources].sort() }))
-    .sort((a, b) => a.host.localeCompare(b.host))
-    .slice(0, LIMITS.subdomains);
+    .sort((a, b) => a.host.localeCompare(b.host));
 
-  return { subdomains, sources: stats };
+  const subdomains: SubdomainRecord[] = all.slice(0, LIMITS.subdomains);
+
+  return { subdomains, sources: stats, truncated: all.length > subdomains.length };
 }
 
 /* -------------------------------------------------------------------------- */
-/* Module 2 — passive historical URL aggregation (GAU / Wayback logic)        */
+/* Module 2 — passive historical URL aggregation (GAU / waybackurls logic)    */
 /* -------------------------------------------------------------------------- */
 
 async function fetchWayback(domain: string, parentSignal: AbortSignal): Promise<string[]> {
@@ -388,26 +601,11 @@ async function fetchCommonCrawl(
 ): Promise<string[]> {
   // The index name rotates every crawl, so resolve the newest one rather than
   // hardcoding an ID that silently rots.
-  const { response: infoResponse, text: infoText } = await fetchText(
+  const collections = await fetchJson<Array<{ 'cdx-api'?: string }>>(
     'https://index.commoncrawl.org/collinfo.json',
-    {
-      parentSignal,
-      timeoutMs: TIMEOUTS.osint,
-      maxBytes: 2_000_000,
-      accept: 'application/json',
-    },
+    { parentSignal, timeoutMs: TIMEOUTS.osint, maxBytes: 2_000_000 },
+    'Common Crawl index list',
   );
-
-  if (!infoResponse.ok) {
-    throw new Error(`Common Crawl index list responded ${infoResponse.status}.`);
-  }
-
-  let collections: Array<{ 'cdx-api'?: string }>;
-  try {
-    collections = JSON.parse(infoText);
-  } catch {
-    throw new Error('Common Crawl index list was malformed.');
-  }
 
   const cdxApi = collections[0]?.['cdx-api'];
   if (!cdxApi) throw new Error('No Common Crawl index is currently available.');
@@ -442,6 +640,32 @@ async function fetchCommonCrawl(
   return urls;
 }
 
+/** OTX's URL list — observed URLs, often more recent than the archives. */
+async function fetchOtxUrls(domain: string, parentSignal: AbortSignal): Promise<string[]> {
+  const urls = new Set<string>();
+
+  // The endpoint pages at 500 rows; two pages is a good depth/latency trade.
+  for (let page = 1; page <= 2; page += 1) {
+    const url =
+      `https://otx.alienvault.com/api/v1/indicators/domain/${encodeURIComponent(domain)}` +
+      `/url_list?limit=500&page=${page}`;
+
+    const payload = await fetchJson<{ url_list?: Array<{ url?: string }>; has_next?: boolean }>(
+      url,
+      { parentSignal, timeoutMs: TIMEOUTS.osint, maxBytes: LIMITS.osintBytes },
+      'AlienVault OTX URLs',
+    );
+
+    for (const row of payload.url_list ?? []) {
+      if (row.url) urls.add(row.url);
+    }
+
+    if (!payload.has_next) break;
+  }
+
+  return [...urls];
+}
+
 async function collectArchivedUrls(
   domain: string,
   parentSignal: AbortSignal,
@@ -449,6 +673,20 @@ async function collectArchivedUrls(
   const { results, stats } = await runSources([
     { name: 'Wayback Machine', run: () => fetchWayback(domain, parentSignal) },
     { name: 'Common Crawl', run: () => fetchCommonCrawl(domain, parentSignal) },
+    { name: 'AlienVault OTX', run: () => fetchOtxUrls(domain, parentSignal) },
+    {
+      name: 'urlscan.io',
+      run: async () => {
+        const rows = await fetchUrlscan(domain, parentSignal);
+        const urls = new Set<string>();
+        for (const row of rows) {
+          for (const candidate of [row.page?.url, row.task?.url]) {
+            if (candidate) urls.add(candidate);
+          }
+        }
+        return [...urls];
+      },
+    },
   ]);
 
   const unique = new Set<string>();
@@ -471,10 +709,10 @@ type HomepageResult =
   | { ok: false; error: string };
 
 /**
- * Fetches the target homepage exactly once and shares it between the tech and
- * JS-endpoint modules, so a scan never hits the target twice for the same body.
+ * Fetches the target homepage exactly once and shares it between every module
+ * that needs markup, so a scan never hits the target twice for the same body.
  *
- * Resolves to a result object instead of rejecting: two modules await this
+ * Resolves to a result object instead of rejecting: several modules await this
  * promise, and a rejected shared promise would surface as an unhandled
  * rejection for whichever consumer attached second.
  */
@@ -525,12 +763,22 @@ const HEADER_RULES: readonly HeaderRule[] = [
   { header: 'server', pattern: /gws/i, name: 'Google Web Server', category: 'Web Server', confidence: 'medium' },
   { header: 'server', pattern: /awselb/i, name: 'AWS ELB', category: 'Load Balancer', confidence: 'high' },
   { header: 'server', pattern: /vercel/i, name: 'Vercel', category: 'Hosting', confidence: 'high' },
+  { header: 'server', pattern: /openresty(?:\/([\d.]+))?/i, name: 'OpenResty $1', category: 'Web Server', confidence: 'high' },
+  { header: 'server', pattern: /tengine/i, name: 'Tengine', category: 'Web Server', confidence: 'high' },
+  { header: 'server', pattern: /gunicorn(?:\/([\d.]+))?/i, name: 'Gunicorn $1', category: 'Application Server', confidence: 'high' },
+  { header: 'server', pattern: /uvicorn/i, name: 'Uvicorn', category: 'Application Server', confidence: 'high' },
+  { header: 'server', pattern: /kestrel/i, name: 'Kestrel (.NET)', category: 'Application Server', confidence: 'high' },
+  { header: 'server', pattern: /jetty(?:\(([\d.]+)\))?/i, name: 'Jetty $1', category: 'Application Server', confidence: 'high' },
+  { header: 'server', pattern: /tomcat(?:\/([\d.]+))?/i, name: 'Tomcat $1', category: 'Application Server', confidence: 'high' },
+  { header: 'server', pattern: /cowboy/i, name: 'Cowboy (Erlang)', category: 'Application Server', confidence: 'medium' },
 
   { header: 'x-powered-by', pattern: /php(?:\/([\d.]+))?/i, name: 'PHP $1', category: 'Language', confidence: 'high' },
   { header: 'x-powered-by', pattern: /asp\.net/i, name: 'ASP.NET', category: 'Framework', confidence: 'high' },
   { header: 'x-powered-by', pattern: /express/i, name: 'Express', category: 'Framework', confidence: 'high' },
   { header: 'x-powered-by', pattern: /next\.js/i, name: 'Next.js', category: 'Framework', confidence: 'high' },
   { header: 'x-powered-by', pattern: /servlet/i, name: 'Java Servlet', category: 'Framework', confidence: 'high' },
+  { header: 'x-powered-by', pattern: /nuxt/i, name: 'Nuxt', category: 'Framework', confidence: 'high' },
+  { header: 'x-powered-by', pattern: /shopify/i, name: 'Shopify', category: 'E-commerce', confidence: 'high' },
 
   { header: 'x-aspnet-version', pattern: /([\d.]+)/, name: 'ASP.NET $1', category: 'Framework', confidence: 'high' },
   { header: 'x-generator', pattern: /drupal\s*([\d.]+)?/i, name: 'Drupal $1', category: 'CMS', confidence: 'high' },
@@ -538,18 +786,30 @@ const HEADER_RULES: readonly HeaderRule[] = [
   { header: 'x-shopify-stage', pattern: /.+/, name: 'Shopify', category: 'E-commerce', confidence: 'high' },
   { header: 'x-wix-request-id', pattern: /.+/, name: 'Wix', category: 'CMS', confidence: 'high' },
   { header: 'x-ghost-cache-status', pattern: /.+/, name: 'Ghost', category: 'CMS', confidence: 'high' },
+  { header: 'x-magento-cache-debug', pattern: /.+/, name: 'Magento', category: 'E-commerce', confidence: 'high' },
+  { header: 'x-hubspot-correlation-id', pattern: /.+/, name: 'HubSpot', category: 'Marketing', confidence: 'high' },
 
   { header: 'cf-ray', pattern: /.+/, name: 'Cloudflare', category: 'CDN / WAF', confidence: 'high' },
+  { header: 'cf-cache-status', pattern: /.+/, name: 'Cloudflare', category: 'CDN / WAF', confidence: 'high' },
   { header: 'x-amz-cf-id', pattern: /.+/, name: 'AWS CloudFront', category: 'CDN', confidence: 'high' },
+  { header: 'x-amz-request-id', pattern: /.+/, name: 'AWS S3', category: 'Storage', confidence: 'medium' },
   { header: 'x-vercel-id', pattern: /.+/, name: 'Vercel', category: 'Hosting', confidence: 'high' },
   { header: 'x-nextjs-cache', pattern: /.+/, name: 'Next.js', category: 'Framework', confidence: 'high' },
+  { header: 'x-nf-request-id', pattern: /.+/, name: 'Netlify', category: 'Hosting', confidence: 'high' },
   { header: 'x-fastly-request-id', pattern: /.+/, name: 'Fastly', category: 'CDN', confidence: 'high' },
+  { header: 'x-served-by', pattern: /cache-/i, name: 'Fastly', category: 'CDN', confidence: 'medium' },
   { header: 'x-akamai-transformed', pattern: /.+/, name: 'Akamai', category: 'CDN', confidence: 'high' },
   { header: 'x-github-request-id', pattern: /.+/, name: 'GitHub Pages', category: 'Hosting', confidence: 'high' },
   { header: 'x-sucuri-id', pattern: /.+/, name: 'Sucuri WAF', category: 'CDN / WAF', confidence: 'high' },
   { header: 'x-varnish', pattern: /.+/, name: 'Varnish', category: 'Cache', confidence: 'high' },
   { header: 'via', pattern: /varnish/i, name: 'Varnish', category: 'Cache', confidence: 'medium' },
   { header: 'x-runtime', pattern: /.+/, name: 'Ruby on Rails', category: 'Framework', confidence: 'low' },
+  { header: 'x-envoy-upstream-service-time', pattern: /.+/, name: 'Envoy', category: 'Proxy', confidence: 'high' },
+  { header: 'x-kong-upstream-latency', pattern: /.+/, name: 'Kong Gateway', category: 'API Gateway', confidence: 'high' },
+  { header: 'x-amzn-requestid', pattern: /.+/, name: 'AWS API Gateway', category: 'API Gateway', confidence: 'high' },
+  { header: 'x-ms-request-id', pattern: /.+/, name: 'Azure', category: 'Hosting', confidence: 'medium' },
+  { header: 'x-cache', pattern: /(?:hit|miss)/i, name: 'CDN cache layer', category: 'Cache', confidence: 'low' },
+  { header: 'x-litespeed-cache', pattern: /.+/, name: 'LiteSpeed Cache', category: 'Cache', confidence: 'high' },
 
   { header: 'strict-transport-security', pattern: /.+/, name: 'HSTS', category: 'Security', confidence: 'high' },
   { header: 'content-security-policy', pattern: /.+/, name: 'CSP', category: 'Security', confidence: 'high' },
@@ -567,6 +827,11 @@ const COOKIE_RULES: ReadonlyArray<{ pattern: RegExp; name: string; category: str
   { pattern: /^connect\.sid$/i, name: 'Express', category: 'Framework' },
   { pattern: /^ci_session$/i, name: 'CodeIgniter', category: 'Framework' },
   { pattern: /^wordpress_|^wp-settings/i, name: 'WordPress', category: 'CMS' },
+  { pattern: /^__cf_bm$|^cf_clearance$/i, name: 'Cloudflare Bot Management', category: 'CDN / WAF' },
+  { pattern: /^incap_ses|^visid_incap/i, name: 'Imperva Incapsula', category: 'CDN / WAF' },
+  { pattern: /^ak_bmsc$|^bm_sv$/i, name: 'Akamai Bot Manager', category: 'CDN / WAF' },
+  { pattern: /^awsalb|^awsalbcors$/i, name: 'AWS ALB', category: 'Load Balancer' },
+  { pattern: /^_shopify_/i, name: 'Shopify', category: 'E-commerce' },
 ];
 
 /**
@@ -592,27 +857,23 @@ const HTML_RULES: ReadonlyArray<{
   { pattern: /jquery(?:[-.]([\d.]+))?(?:\.min)?\.js/i, name: 'jQuery $1', category: 'Library', confidence: 'medium' },
   { pattern: /bootstrap(?:[-.]([\d.]+))?(?:\.min)?\.css/i, name: 'Bootstrap $1', category: 'UI Framework', confidence: 'medium' },
   { pattern: /googletagmanager\.com\/gtm\.js/i, name: 'Google Tag Manager', category: 'Analytics', confidence: 'high' },
+  { pattern: /google-analytics\.com\/analytics\.js|gtag\/js\?id=/i, name: 'Google Analytics', category: 'Analytics', confidence: 'high' },
+  { pattern: /connect\.facebook\.net\/[^"']+\/fbevents\.js/i, name: 'Meta Pixel', category: 'Analytics', confidence: 'high' },
+  { pattern: /cdn\.segment\.com\/analytics\.js/i, name: 'Segment', category: 'Analytics', confidence: 'high' },
+  { pattern: /js\.stripe\.com/i, name: 'Stripe', category: 'Payments', confidence: 'high' },
+  { pattern: /js\.hs-scripts\.com|hs-analytics\.net/i, name: 'HubSpot', category: 'Marketing', confidence: 'high' },
+  { pattern: /static\.zdassets\.com|zendesk\.com\/embeddable/i, name: 'Zendesk', category: 'Support', confidence: 'high' },
+  { pattern: /widget\.intercom\.io|intercomcdn\.com/i, name: 'Intercom', category: 'Support', confidence: 'high' },
+  { pattern: /browser\.sentry-cdn\.com|@sentry\//i, name: 'Sentry', category: 'Monitoring', confidence: 'high' },
+  { pattern: /cdn\.optimizely\.com/i, name: 'Optimizely', category: 'A/B Testing', confidence: 'high' },
+  { pattern: /recaptcha\/api\.js|hcaptcha\.com\/1\/api\.js/i, name: 'CAPTCHA', category: 'Security', confidence: 'high' },
+  { pattern: /auth0\.com\/js|cdn\.auth0\.com/i, name: 'Auth0', category: 'Identity', confidence: 'high' },
+  { pattern: /firebaseapp\.com|firebasejs/i, name: 'Firebase', category: 'Backend', confidence: 'high' },
+  { pattern: /cdn\.jsdelivr\.net|unpkg\.com|cdnjs\.cloudflare\.com/i, name: 'Public CDN assets', category: 'CDN', confidence: 'low' },
 ];
 
 function applyTemplate(template: string, match: RegExpMatchArray): string {
   return template.replace('$1', match[1] ?? '').trim();
-}
-
-/** Reads `Set-Cookie` names only — values are deliberately never captured. */
-function readCookieNames(headers: Headers): string[] {
-  const raw =
-    typeof headers.getSetCookie === 'function'
-      ? headers.getSetCookie()
-      : headers.get('set-cookie')
-        ? [headers.get('set-cookie') as string]
-        : [];
-
-  const names = new Set<string>();
-  for (const cookie of raw) {
-    const name = cookie.split('=')[0]?.trim();
-    if (name) names.add(name);
-  }
-  return [...names];
 }
 
 async function fingerprintTech(homepage: Promise<HomepageResult>): Promise<TechPayload> {
@@ -643,14 +904,14 @@ async function fingerprintTech(homepage: Promise<HomepageResult>): Promise<TechP
     });
   }
 
-  const cookieNames = readCookieNames(response.headers);
-  for (const cookieName of cookieNames) {
+  const cookies = readCookies(response.headers);
+  for (const cookie of cookies) {
     for (const rule of COOKIE_RULES) {
-      if (!rule.pattern.test(cookieName)) continue;
+      if (!rule.pattern.test(cookie.name)) continue;
       add({
         name: rule.name,
         category: rule.category,
-        evidence: `Set-Cookie: ${cookieName}`,
+        evidence: `Set-Cookie: ${cookie.name}`,
         confidence: 'high',
       });
     }
@@ -667,26 +928,32 @@ async function fingerprintTech(homepage: Promise<HomepageResult>): Promise<TechP
     });
   }
 
-  // Set-Cookie is excluded on purpose; its names are reported separately and
-  // its values are never persisted into a report the operator may share.
+  // Set-Cookie is excluded on purpose; its names and flags are reported
+  // separately and its values are never persisted into a shareable report.
   const headers: HeaderRecord[] = [...response.headers.entries()]
     .filter(([name]) => name.toLowerCase() !== 'set-cookie')
     .map(([name, value]) => ({ name, value: value.slice(0, 300) }))
     .sort((a, b) => a.name.localeCompare(b.name));
 
+  const audit = auditSecurityHeaders(response.headers);
+
   return {
     finalUrl,
     status: response.status,
+    redirected: response.redirected,
     technologies: [...found.values()].sort(
       (a, b) => a.category.localeCompare(b.category) || a.name.localeCompare(b.name),
     ),
     headers,
-    cookieNames,
+    cookies,
+    security: audit.checks,
+    grade: audit.grade,
+    identity: parsePageIdentity(html),
   };
 }
 
 /* -------------------------------------------------------------------------- */
-/* Module 4 — static JS endpoint mining                                       */
+/* Module 4 — static JS mining (LinkFinder + SecretFinder logic)              */
 /* -------------------------------------------------------------------------- */
 
 async function collectJsEndpoints(
@@ -700,6 +967,21 @@ async function collectJsEndpoints(
   const allScripts = extractScriptUrls(result.html, result.finalUrl);
   const scripts = allScripts.slice(0, LIMITS.scripts);
 
+  const endpoints = new Set<string>();
+  const hosts = new Set<string>();
+  const sourceMaps = new Set<string>();
+  const secrets: SecretMatch[] = [];
+
+  // Inline blocks come free with the homepage we already hold, and are where
+  // bootstrap configuration (and its API keys) usually lives.
+  const inline = extractInlineScripts(result.html);
+  for (const block of inline) {
+    for (const endpoint of extractEndpoints(block, domain)) endpoints.add(endpoint);
+    for (const host of extractHosts(block, domain)) hosts.add(host);
+    secrets.push(...scanSecrets(block, `${result.finalUrl} (inline)`));
+  }
+  for (const host of extractHosts(result.html, domain)) hosts.add(host);
+
   const settled = await Promise.allSettled(
     scripts.map(async (scriptUrl) => {
       const { text } = await fetchText(scriptUrl, {
@@ -708,17 +990,27 @@ async function collectJsEndpoints(
         maxBytes: LIMITS.scriptBytes,
         accept: 'application/javascript,text/javascript,*/*;q=0.8',
       });
-      return extractEndpoints(text, domain);
+
+      return {
+        url: scriptUrl,
+        endpoints: extractEndpoints(text, domain),
+        hosts: extractHosts(text, domain),
+        secrets: scanSecrets(text, scriptUrl),
+        sourceMaps: extractSourceMaps(text, scriptUrl),
+      };
     }),
   );
 
-  const endpoints = new Set<string>();
   let scanned = 0;
 
   for (const outcome of settled) {
     if (outcome.status !== 'fulfilled') continue;
     scanned += 1;
-    for (const endpoint of outcome.value) endpoints.add(endpoint);
+
+    for (const endpoint of outcome.value.endpoints) endpoints.add(endpoint);
+    for (const host of outcome.value.hosts) hosts.add(host);
+    for (const map of outcome.value.sourceMaps) sourceMaps.add(map);
+    secrets.push(...outcome.value.secrets);
   }
 
   const all = [...endpoints].sort();
@@ -727,12 +1019,16 @@ async function collectJsEndpoints(
     scripts: allScripts,
     endpoints: all.slice(0, LIMITS.endpoints),
     scanned,
+    inlineScripts: inline.length,
     truncated: all.length > LIMITS.endpoints || allScripts.length > scripts.length,
+    secrets: secrets.slice(0, LIMITS.secrets),
+    sourceMaps: [...sourceMaps].sort(),
+    hosts: [...hosts].sort(),
   };
 }
 
 /* -------------------------------------------------------------------------- */
-/* Module 5 — recon extras (robots.txt, sitemap, security.txt, favicon)       */
+/* Module 5 — recon extras (robots, sitemap, security.txt, favicon, well-known)*/
 /* -------------------------------------------------------------------------- */
 
 async function fetchRobotsTxt(
@@ -909,6 +1205,73 @@ async function fetchFavicon(
 }
 
 /**
+ * Requests the fixed list of standardised public files.
+ *
+ * Each one is a published convention an ordinary client already asks for
+ * (`assetlinks.json` by Android, `apple-app-site-association` by iOS, `ads.txt`
+ * by every ad verifier). They are worth collecting because they name the app's
+ * platform integrations — package IDs, OAuth endpoints, ad partners.
+ */
+async function fetchWellKnown(
+  domain: string,
+  parentSignal: AbortSignal,
+): Promise<WellKnownFile[]> {
+  const settled = await Promise.allSettled(
+    WELL_KNOWN_PATHS.map(async (path): Promise<WellKnownFile> => {
+      const url = `https://${domain}${path}`;
+      const absent: WellKnownFile = {
+        path,
+        url,
+        found: false,
+        status: null,
+        contentType: null,
+        bytes: null,
+        preview: null,
+      };
+
+      try {
+        const { response, text } = await fetchText(url, {
+          parentSignal,
+          timeoutMs: TIMEOUTS.meta,
+          maxBytes: LIMITS.wellKnownBytes,
+        });
+
+        if (!response.ok) return { ...absent, status: response.status };
+
+        const contentType = response.headers.get('content-type');
+        const trimmed = text.trim();
+
+        // Many hosts answer every path with the SPA shell; a file that is just
+        // the site's HTML is not the file we asked for.
+        const isHtmlShell = /^<(?:!doctype|html)/i.test(trimmed);
+        if (trimmed.length === 0 || isHtmlShell) {
+          return { ...absent, status: response.status, contentType };
+        }
+
+        return {
+          path,
+          url,
+          found: true,
+          status: response.status,
+          contentType,
+          bytes: trimmed.length,
+          preview: trimmed.slice(0, LIMITS.wellKnownPreview),
+        };
+      } catch {
+        return absent;
+      }
+    }),
+  );
+
+  return settled
+    .filter(
+      (outcome): outcome is PromiseFulfilledResult<WellKnownFile> =>
+        outcome.status === 'fulfilled',
+    )
+    .map((outcome) => outcome.value);
+}
+
+/**
  * Best-effort metadata sweep.
  *
  * Every sub-fetch absorbs its own failure into a `found: false` result, so this
@@ -926,13 +1289,160 @@ async function collectMeta(
   // robots.txt runs first because it declares the sitemaps the next step reads.
   const robots = await fetchRobotsTxt(domain, parentSignal);
 
-  const [sitemap, securityTxt, favicon] = await Promise.all([
+  const [sitemap, securityTxt, favicon, wellKnown] = await Promise.all([
     fetchSitemap(domain, sameSiteSitemaps(robots.sitemaps, domain), parentSignal),
     fetchSecurityTxt(domain, parentSignal),
     fetchFavicon(page, parentSignal),
+    fetchWellKnown(domain, parentSignal),
   ]);
 
-  return { robots, sitemap, securityTxt, favicon };
+  return { robots, sitemap, securityTxt, favicon, wellKnown };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Module 6 — email security posture                                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Builds the mail posture from records the DNS module already fetched, plus the
+ * two lookups only this module needs (`_dmarc` and the DKIM selectors).
+ *
+ * Reusing the shared DNS payload matters: SPF and MX live in the apex records
+ * we have already paid for, so re-querying them would double the traffic for no
+ * new information.
+ */
+async function collectMailSecurity(
+  domain: string,
+  dns: Promise<Settled<ModulePayloads['dns']>>,
+): Promise<MailPayload> {
+  const records = (await unwrapOr(dns, { records: [], sources: [] })).records;
+
+  const txt = records.filter((record) => record.type === 'TXT').map((record) => record.value);
+  const mx = records
+    .filter((record) => record.type === 'MX')
+    .sort((a, b) => (a.priority ?? 0) - (b.priority ?? 0));
+
+  const caaFromDns = records
+    .filter((record) => record.type === 'CAA')
+    .map((record) => record.value);
+
+  const [dmarcTxt, caa, dkim] = await Promise.all([
+    resolveTxtFor(`_dmarc.${domain}`),
+    caaFromDns.length > 0 ? Promise.resolve(caaFromDns) : resolveCaaFor(domain),
+    Promise.all(
+      COMMON_DKIM_SELECTORS.map(async (selector) => ({
+        selector,
+        // A DKIM key lives at <selector>._domainkey.<domain>; there is no way to
+        // enumerate selectors, so a miss proves nothing (see mail-security.ts).
+        ...parseDkimKey(await resolveTxtFor(`${selector}._domainkey.${domain}`)),
+      })),
+    ),
+  ]);
+
+  return {
+    spf: parseSpf(txt),
+    dmarc: parseDmarc(dmarcTxt),
+    mx,
+    caa,
+    dkim,
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Module 7 — registration (RDAP) and network ownership (ASN)                 */
+/* -------------------------------------------------------------------------- */
+
+async function collectWhois(
+  domain: string,
+  dns: Promise<Settled<ModulePayloads['dns']>>,
+  parentSignal: AbortSignal,
+): Promise<WhoisPayload> {
+  const sources: SourceStat[] = [];
+
+  // RDAP: the IANA bootstrap service redirects to the registry that owns the
+  // TLD, so one URL works for every domain without a per-TLD table.
+  let domainRecord = EMPTY_WHOIS;
+  try {
+    const payload = await fetchJson<Parameters<typeof parseRdapDomain>[0]>(
+      `https://rdap.org/domain/${encodeURIComponent(domain)}`,
+      { parentSignal, timeoutMs: TIMEOUTS.rdap, maxBytes: 2_000_000 },
+      'RDAP',
+    );
+    domainRecord = parseRdapDomain(payload);
+    sources.push({ source: 'RDAP', ok: true, count: 1 });
+  } catch (error) {
+    sources.push({ source: 'RDAP', ok: false, count: 0, error: toMessage(error) });
+  }
+
+  const addresses = (await unwrapOr(dns, { records: [], sources: [] })).records
+    .filter((record) => record.type === 'A')
+    .map((record) => record.value)
+    .slice(0, LIMITS.asnLookups);
+
+  const networks = await Promise.all(
+    addresses.map(async (ip) => ({ ip, org: null, ...(await lookupAsn(ip)) })),
+  );
+
+  sources.push({
+    source: 'Team Cymru ASN',
+    ok: networks.some((network) => network.asn !== null) || networks.length === 0,
+    count: networks.filter((network) => network.asn !== null).length,
+  });
+
+  return { domain: domainRecord, networks, sources };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Module 8 — URL intelligence (derived from every URL the scan produced)     */
+/* -------------------------------------------------------------------------- */
+
+async function collectUrlIntel(
+  domain: string,
+  archived: Promise<Settled<ArchivedPayload>>,
+  meta: Promise<Settled<MetaPayload>>,
+  js: Promise<Settled<JsEndpointsPayload>>,
+): Promise<UrlIntelPayload> {
+  const [archivedResult, metaResult, jsResult] = await Promise.all([archived, meta, js]);
+
+  const urls: string[] = [];
+  const failures: string[] = [];
+
+  if (archivedResult.ok) urls.push(...archivedResult.value.urls);
+  else failures.push(`archives (${archivedResult.error})`);
+  if (!metaResult.ok) failures.push(`sitemap (${metaResult.error})`);
+  if (!jsResult.ok) failures.push(`JavaScript (${jsResult.error})`);
+
+  if (metaResult.ok) {
+    urls.push(...metaResult.value.sitemap.urls);
+    // robots.txt disallow entries are paths, not URLs; resolving them makes
+    // them analysable alongside everything else without losing the origin.
+    for (const path of metaResult.value.robots.disallowed) {
+      try {
+        urls.push(new URL(path, `https://${domain}/`).toString());
+      } catch {
+        continue;
+      }
+    }
+  }
+
+  if (jsResult.ok) {
+    for (const endpoint of jsResult.value.endpoints) {
+      try {
+        urls.push(new URL(endpoint, `https://${domain}/`).toString());
+      } catch {
+        continue;
+      }
+    }
+  }
+
+  // An empty result is a legitimate answer — a young domain with no archive
+  // history really has no URLs. It is only a module failure when the upstreams
+  // that would have supplied them broke, which is worth saying out loud.
+  if (urls.length === 0 && failures.length > 0) {
+    throw new Error(`No URLs to analyse: ${failures.join('; ')}`);
+  }
+
+  return analyzeUrls(urls, domain);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -964,7 +1474,6 @@ export async function POST(request: NextRequest): Promise<Response> {
     return badRequest('Request body must be valid JSON.');
   }
 
-  // Note: this endpoint takes `domain`, not the `target` key used by /api/scan.
   const raw = (body as { domain?: unknown } | null)?.domain;
   const sanitized = sanitizeDomain(raw);
   if (!sanitized.ok) return badRequest(sanitized.error);
@@ -992,6 +1501,7 @@ export async function POST(request: NextRequest): Promise<Response> {
       };
 
       const startedAt = Date.now();
+      const signal = request.signal;
 
       try {
         send({
@@ -1001,8 +1511,15 @@ export async function POST(request: NextRequest): Promise<Response> {
           modules: [...MODULE_IDS],
         });
 
-        // One shared request to the target, consumed by two modules.
-        const homepage = fetchHomepage(domain, request.signal);
+        // Work that more than one module consumes is started once here and
+        // shared. `share` folds rejection into the value so a failure surfaces
+        // in every consumer instead of becoming an unhandled rejection.
+        const homepage = fetchHomepage(domain, signal);
+        const subdomains = share(collectSubdomains(domain, signal));
+        const dns = share(collectDnsRecords(domain));
+        const archived = share(collectArchivedUrls(domain, signal));
+        const meta = share(collectMeta(domain, homepage, signal));
+        const js = share(collectJsEndpoints(domain, homepage, signal));
 
         const run = async <K extends ModuleId>(
           module: K,
@@ -1026,14 +1543,29 @@ export async function POST(request: NextRequest): Promise<Response> {
         // allSettled is belt-and-braces: `run` already absorbs its own errors,
         // so this is purely the join barrier that lets every module finish.
         await Promise.allSettled([
-          run('subdomains', () => collectSubdomains(domain, request.signal)),
-          run('archived', () => collectArchivedUrls(domain, request.signal)),
+          run('subdomains', () => unwrap(subdomains)),
+          run('takeover', async (): Promise<TakeoverPayload> => {
+            const discovered = await unwrap(subdomains);
+            const hosts = [domain, ...discovered.subdomains.map((record) => record.host)];
+            const unique = [...new Set(hosts)];
+
+            const resolutions = await sweepHosts(unique, LIMITS.resolveHosts);
+
+            return {
+              total: unique.length,
+              checked: resolutions.length,
+              live: resolutions.filter((host) => host.status === 'live').length,
+              hosts: resolutions,
+            };
+          }),
+          run('dns', () => unwrap(dns)),
+          run('mail', () => collectMailSecurity(domain, dns)),
+          run('whois', () => collectWhois(domain, dns, signal)),
           run('tech', () => fingerprintTech(homepage)),
-          run('js-endpoints', () =>
-            collectJsEndpoints(domain, homepage, request.signal),
-          ),
-          run('dns', () => collectDnsRecords(domain)),
-          run('meta', () => collectMeta(domain, homepage, request.signal)),
+          run('js-endpoints', () => unwrap(js)),
+          run('archived', () => unwrap(archived)),
+          run('url-intel', () => collectUrlIntel(domain, archived, meta, js)),
+          run('meta', () => unwrap(meta)),
         ]);
 
         send({

@@ -168,3 +168,46 @@ export function extractEndpoints(js: string, sameHost?: string): string[] {
 
   return [...found];
 }
+
+/** `<script>` blocks with no `src` — inline config objects live here. */
+const INLINE_SCRIPT_RE = /<script\b(?![^>]*\bsrc\s*=)[^>]*>([\s\S]*?)<\/script>/gi;
+
+/**
+ * Returns the body of every inline `<script>` in a document.
+ *
+ * Worth parsing separately from bundles: inline blocks are where a framework
+ * dumps its bootstrap config, and that is routinely where an API key, an
+ * internal hostname or a full user object ends up.
+ */
+export function extractInlineScripts(html: string): string[] {
+  const blocks: string[] = [];
+
+  for (const match of html.matchAll(INLINE_SCRIPT_RE)) {
+    const body = match[1]?.trim();
+    if (body && body.length > 0) blocks.push(body);
+  }
+
+  return blocks;
+}
+
+/** Hostname-shaped tokens, deliberately loose — the caller filters by scope. */
+const HOSTNAME_RE = /\b((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.){1,6}[a-z]{2,24})\b/gi;
+
+/**
+ * Mines text for hostnames inside the target's own domain.
+ *
+ * JavaScript bundles regularly name hosts that no certificate log and no
+ * passive-DNS index has ever seen — internal APIs, regional endpoints, staging
+ * environments — which makes this one of the better subdomain sources.
+ */
+export function extractHosts(text: string, domain: string): string[] {
+  const suffix = `.${domain.toLowerCase()}`;
+  const found = new Set<string>();
+
+  for (const match of text.matchAll(HOSTNAME_RE)) {
+    const host = match[1].toLowerCase();
+    if (host === domain || host.endsWith(suffix)) found.add(host);
+  }
+
+  return [...found].sort();
+}
