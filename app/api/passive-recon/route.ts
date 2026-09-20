@@ -100,7 +100,7 @@ export const runtime = 'nodejs';
 export const maxDuration = 120;
 
 const USER_AGENT =
-  'Mozilla/5.0 (compatible; PassiveReconDashboard/2.0; +passive-osint)';
+  'Mozilla/5.0 (compatible; BulletReconDashboard/2.0; +passive-osint)';
 
 const TIMEOUTS = {
   osint: 20_000,

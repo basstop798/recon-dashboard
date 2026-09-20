@@ -16,25 +16,32 @@ import {
 } from '@/lib/passive-recon/types';
 
 import {
+  CheckMark,
   CopyButton,
+  DataList,
+  DataRow,
+  DataTable,
   EmptyState,
   FilterInput,
   KeyValue,
+  MONO,
   Panel,
   Pill,
   SourceStats,
+  Td,
+  Tr,
   cx,
 } from './ui';
 
 const RECORD_TONE: Record<string, string> = {
-  A: 'text-emerald-300',
-  AAAA: 'text-emerald-300',
-  CNAME: 'text-cyan-300',
-  MX: 'text-violet-300',
-  TXT: 'text-amber-200',
-  NS: 'text-sky-300',
-  SOA: 'text-zinc-400',
-  CAA: 'text-rose-300',
+  A: 'bg-emerald-500/10 text-emerald-300 ring-emerald-500/20',
+  AAAA: 'bg-emerald-500/10 text-emerald-300 ring-emerald-500/20',
+  CNAME: 'bg-cyan-500/10 text-cyan-300 ring-cyan-500/20',
+  MX: 'bg-violet-500/10 text-violet-300 ring-violet-500/20',
+  TXT: 'bg-amber-500/10 text-amber-300 ring-amber-500/20',
+  NS: 'bg-sky-500/10 text-sky-300 ring-sky-500/20',
+  SOA: 'bg-zinc-500/10 text-zinc-300 ring-zinc-500/20',
+  CAA: 'bg-rose-500/10 text-rose-300 ring-rose-500/20',
 };
 
 export function DnsTab({ state, data }: { state: ModuleState; data: DnsPayload | null }) {
@@ -78,41 +85,30 @@ export function DnsTab({ state, data }: { state: ModuleState; data: DnsPayload |
     >
       <SourceStats sources={data?.sources ?? []} />
 
-      <div className="mb-3">
+      <div className="mb-4">
         <FilterInput value={filter} onChange={setFilter} placeholder="Filter records…" />
       </div>
 
-      <div className="overflow-x-auto">
-        <table className="w-full text-left">
-          <thead>
-            <tr className="font-mono text-[11px] tracking-wider text-zinc-600 uppercase">
-              <th className="py-2 pr-4 font-medium">Type</th>
-              <th className="py-2 pr-4 font-medium">Value</th>
-              <th className="py-2 font-medium">Priority</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-white/5">
-            {filtered.map((record, index) => (
-              <tr key={`${record.type}-${record.value}-${index}`} className="align-top">
-                <td
-                  className={cx(
-                    'py-2 pr-4 font-mono text-xs font-semibold',
-                    RECORD_TONE[record.type] ?? 'text-zinc-300',
-                  )}
-                >
-                  {record.type}
-                </td>
-                <td className="py-2 pr-4 font-mono text-xs break-all text-zinc-300">
-                  {record.value}
-                </td>
-                <td className="py-2 font-mono text-xs text-zinc-600">
-                  {record.priority ?? ''}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      <DataTable columns={['Type', 'Value', 'Priority']}>
+        {filtered.map((record, index) => (
+          <Tr key={`${record.type}-${record.value}-${index}`}>
+            <Td className="w-px whitespace-nowrap">
+              <span
+                className={cx(
+                  'inline-flex rounded-md px-2 py-0.5 font-mono text-xs font-semibold ring-1 ring-inset',
+                  RECORD_TONE[record.type] ?? 'bg-white/5 text-zinc-300 ring-white/10',
+                )}
+              >
+                {record.type}
+              </span>
+            </Td>
+            <Td mono className="break-all text-zinc-200">
+              {record.value}
+            </Td>
+            <Td className="w-px text-zinc-400 tabular-nums">{record.priority ?? ''}</Td>
+          </Tr>
+        ))}
+      </DataTable>
     </Panel>
   );
 }
@@ -123,27 +119,35 @@ function PolicyRow({
   label,
   ok,
   value,
+  missing,
   note,
 }: {
   label: string;
   ok: boolean;
-  value: string;
+  /** The raw record, shown verbatim; null when there is nothing to show. */
+  value: string | null;
+  /** Plain-language stand-in for a missing value. */
+  missing: string;
   note: string;
 }) {
   return (
-    <div className="flex flex-wrap items-start gap-3 border-b border-white/5 py-3 last:border-0">
-      <span
-        className={cx(
-          'mt-0.5 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[11px] font-bold',
-          ok ? 'bg-emerald-500/15 text-emerald-300' : 'bg-rose-500/15 text-rose-300',
-        )}
-      >
-        {ok ? '✓' : '✗'}
-      </span>
+    <div className="flex items-start gap-4 border-b border-white/5 py-5 first:pt-0 last:border-0 last:pb-0">
+      <CheckMark ok={ok} />
       <div className="min-w-0 flex-1">
-        <p className="font-mono text-xs font-semibold text-zinc-200">{label}</p>
-        <p className="mt-0.5 font-mono text-xs break-all text-zinc-400">{value}</p>
-        <p className="mt-1 text-xs text-zinc-500">{note}</p>
+        <p className="text-sm font-semibold text-zinc-100">{label}</p>
+        {value ? (
+          <p
+            className={cx(
+              MONO,
+              'mt-2 rounded-md bg-zinc-950/60 px-3 py-2 break-all text-zinc-300 ring-1 ring-white/5 ring-inset',
+            )}
+          >
+            {value}
+          </p>
+        ) : (
+          <p className="mt-1 text-sm text-zinc-500">{missing}</p>
+        )}
+        <p className="mt-2 text-sm leading-relaxed text-zinc-400">{note}</p>
       </div>
     </div>
   );
@@ -168,7 +172,7 @@ export function MailTab({ state, data }: { state: ModuleState; data: MailPayload
     dmarc.found && (dmarc.policy === 'reject' || dmarc.policy === 'quarantine');
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-6">
       <Panel
         title="Spoofing posture"
         subtitle="Whether a stranger can send mail that claims to come from this domain."
@@ -176,7 +180,8 @@ export function MailTab({ state, data }: { state: ModuleState; data: MailPayload
         <PolicyRow
           label="SPF"
           ok={spfStrong}
-          value={spf.raw ?? 'not published'}
+          value={spf.raw}
+          missing="Not published."
           note={
             !spf.found
               ? 'No SPF record: receivers have no list of authorised senders.'
@@ -186,7 +191,8 @@ export function MailTab({ state, data }: { state: ModuleState; data: MailPayload
         <PolicyRow
           label="DMARC"
           ok={dmarcStrong}
-          value={dmarc.raw ?? 'not published'}
+          value={dmarc.raw}
+          missing="Not published."
           note={
             !dmarc.found
               ? 'No DMARC record: nothing tells receivers what to do with a forgery.'
@@ -198,39 +204,44 @@ export function MailTab({ state, data }: { state: ModuleState; data: MailPayload
         <PolicyRow
           label="DKIM (common selectors)"
           ok={foundSelectors.length > 0}
-          value={
-            foundSelectors.map((entry) => entry.selector).join(', ') ||
-            (revokedSelectors.length > 0
-              ? `published but revoked (empty p=): ${revokedSelectors.map((entry) => entry.selector).join(', ')}`
-              : 'none of the probed selectors carry a key')
+          value={foundSelectors.map((entry) => entry.selector).join(', ') || null}
+          missing={
+            revokedSelectors.length > 0
+              ? `Published but revoked (empty p=): ${revokedSelectors.map((entry) => entry.selector).join(', ')}.`
+              : 'None of the probed selectors carry a key.'
           }
           note="Selectors cannot be enumerated, so a miss is inconclusive — it only means none of the conventional names hold a usable key."
         />
         <PolicyRow
           label="CAA"
           ok={caa.length > 0}
-          value={caa.join(' · ') || 'not published'}
+          value={caa.join(' · ') || null}
+          missing="Not published."
           note="CAA restricts which certificate authorities may issue for this domain."
         />
       </Panel>
 
       <Panel title="Mail exchangers" subtitle="In preference order — lower wins.">
         {nullMx ? (
-          <p className="text-sm text-zinc-500">
-            Null MX (<code className="font-mono text-xs">MX 0 .</code>, RFC 7505): the domain
-            explicitly declares that it accepts no mail.
+          <p className="text-sm text-zinc-400">
+            Null MX (<code className="font-mono text-[13px] text-zinc-300">MX 0 .</code>, RFC
+            7505): the domain explicitly declares that it accepts no mail.
           </p>
         ) : mx.length === 0 ? (
-          <p className="text-sm text-zinc-500">No MX records: this domain does not receive mail.</p>
+          <p className="text-sm text-zinc-400">No MX records: this domain does not receive mail.</p>
         ) : (
-          <ul className="divide-y divide-white/5">
+          <DataList>
             {mx.map((record) => (
-              <li key={record.value} className="flex items-center gap-3 py-2">
-                <Pill>{record.priority ?? '—'}</Pill>
-                <span className="font-mono text-xs break-all text-zinc-300">{record.value}</span>
-              </li>
+              <DataRow key={record.value}>
+                <span className="w-10 shrink-0">
+                  <Pill>
+                    <span className="tabular-nums">{record.priority ?? '—'}</span>
+                  </Pill>
+                </span>
+                <span className={cx(MONO, 'break-all text-zinc-200')}>{record.value}</span>
+              </DataRow>
             ))}
-          </ul>
+          </DataList>
         )}
       </Panel>
 
@@ -242,7 +253,9 @@ export function MailTab({ state, data }: { state: ModuleState; data: MailPayload
           <ul className="flex flex-wrap gap-2">
             {spf.includes.map((include) => (
               <li key={include}>
-                <Pill tone="accent">{include}</Pill>
+                <Pill tone="accent" mono>
+                  {include}
+                </Pill>
               </li>
             ))}
           </ul>
@@ -266,42 +279,49 @@ export function WhoisTab({ state, data }: { state: ModuleState; data: WhoisPaylo
   const { domain, networks } = data;
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-6">
       <Panel title="Registration (RDAP)" subtitle="Structured registry data — the modern WHOIS.">
         <SourceStats sources={data.sources} />
         {!domain.found ? (
-          <p className="text-sm text-zinc-500">
+          <p className="text-sm text-zinc-400">
             No RDAP record was returned. Some ccTLD registries do not run an RDAP service.
           </p>
         ) : (
           <KeyValue
             rows={[
               { key: 'Registrar', value: domain.registrar ?? '—' },
-              { key: 'Created', value: domain.createdAt ?? '—' },
-              { key: 'Last changed', value: domain.updatedAt ?? '—' },
-              { key: 'Expires', value: domain.expiresAt ?? '—' },
+              { key: 'Created', value: domain.createdAt ?? '—', mono: true },
+              { key: 'Last changed', value: domain.updatedAt ?? '—', mono: true },
+              { key: 'Expires', value: domain.expiresAt ?? '—', mono: true },
               {
                 key: 'DNSSEC',
                 value:
-                  domain.dnssec === null ? '—' : domain.dnssec ? 'signed' : 'not signed',
+                  domain.dnssec === null ? '—' : domain.dnssec ? 'Signed' : 'Not signed',
               },
               {
                 key: 'Statuses',
-                value: (
-                  <span className="flex flex-wrap gap-1">
-                    {domain.statuses.map((status) => (
-                      <Pill key={status}>{status}</Pill>
-                    ))}
-                  </span>
-                ),
+                value:
+                  domain.statuses.length === 0 ? (
+                    '—'
+                  ) : (
+                    <span className="flex flex-wrap gap-1.5">
+                      {domain.statuses.map((status) => (
+                        <Pill key={status} mono>
+                          {status}
+                        </Pill>
+                      ))}
+                    </span>
+                  ),
               },
               {
                 key: 'Nameservers',
                 value: domain.nameservers.join(', ') || '—',
+                mono: true,
               },
               {
                 key: 'Abuse contact',
                 value: domain.abuseContacts.join(', ') || '—',
+                mono: true,
               },
             ]}
           />
@@ -313,40 +333,25 @@ export function WhoisTab({ state, data }: { state: ModuleState; data: WhoisPaylo
         subtitle="Origin AS for each apex address — the netblock is where the rest of the estate usually lives."
       >
         {networks.length === 0 ? (
-          <p className="text-sm text-zinc-500">No IPv4 addresses were resolved for the apex.</p>
+          <p className="text-sm text-zinc-400">No IPv4 addresses were resolved for the apex.</p>
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-left">
-              <thead>
-                <tr className="font-mono text-[11px] tracking-wider text-zinc-600 uppercase">
-                  <th className="py-2 pr-4 font-medium">IP</th>
-                  <th className="py-2 pr-4 font-medium">ASN</th>
-                  <th className="py-2 pr-4 font-medium">Network</th>
-                  <th className="py-2 pr-4 font-medium">Prefix</th>
-                  <th className="py-2 font-medium">Country</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-white/5">
-                {networks.map((network) => (
-                  <tr key={network.ip}>
-                    <td className="py-2 pr-4 font-mono text-xs text-zinc-200">{network.ip}</td>
-                    <td className="py-2 pr-4 font-mono text-xs text-emerald-300">
-                      {network.asn ? `AS${network.asn}` : '—'}
-                    </td>
-                    <td className="py-2 pr-4 font-mono text-xs text-zinc-300">
-                      {network.asnName ?? '—'}
-                    </td>
-                    <td className="py-2 pr-4 font-mono text-xs text-zinc-400">
-                      {network.prefix ?? '—'}
-                    </td>
-                    <td className="py-2 font-mono text-xs text-zinc-400">
-                      {network.country ?? '—'}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <DataTable columns={['IP', 'ASN', 'Network', 'Prefix', 'Country']}>
+            {networks.map((network) => (
+              <Tr key={network.ip}>
+                <Td mono className="text-zinc-100">
+                  {network.ip}
+                </Td>
+                <Td mono className="text-emerald-400">
+                  {network.asn ? `AS${network.asn}` : '—'}
+                </Td>
+                <Td className="text-zinc-300">{network.asnName ?? '—'}</Td>
+                <Td mono className="text-zinc-400">
+                  {network.prefix ?? '—'}
+                </Td>
+                <Td className="text-zinc-400">{network.country ?? '—'}</Td>
+              </Tr>
+            ))}
+          </DataTable>
         )}
       </Panel>
     </div>

@@ -1,4 +1,4 @@
-# PassiveRecon
+# BulletRecon
 
 A one-click passive reconnaissance dashboard for bug bounty and authorised
 security work. Enter a domain, press one button, and ten OSINT modules run in

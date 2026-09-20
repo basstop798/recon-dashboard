@@ -19,7 +19,18 @@ import {
   type Severity,
 } from '@/lib/passive-recon/types';
 
-import { CopyButton, Panel, SEVERITY_STYLES, SeverityBadge, cx } from './ui';
+import { ArrowRightIcon } from './icons';
+import {
+  CopyButton,
+  DataList,
+  DataRow,
+  FilterChip,
+  INSET,
+  Panel,
+  SEVERITY_STYLES,
+  SeverityBadge,
+  cx,
+} from './ui';
 
 export function OverviewTab({
   report,
@@ -46,7 +57,7 @@ export function OverviewTab({
   ) as Array<[ModuleId, ScanReport['modules'][ModuleId]]>;
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-6">
       <Panel
         title={`${findings.length} finding${findings.length === 1 ? '' : 's'}`}
         subtitle="Derived from module output. Everything here is a lead to verify — nothing was actively tested."
@@ -64,39 +75,26 @@ export function OverviewTab({
           )
         }
       >
-        <div className="mb-4 flex flex-wrap gap-2">
-          <button
-            type="button"
-            onClick={() => setFilter(null)}
-            className={cx(
-              'rounded-lg border px-3 py-1 font-mono text-xs transition-colors',
-              filter === null
-                ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-300'
-                : 'border-white/10 bg-white/5 text-zinc-400 hover:text-zinc-200',
-            )}
-          >
-            all <span className="ml-1 text-zinc-600">{findings.length}</span>
-          </button>
+        <div className="mb-5 flex flex-wrap gap-2" role="group" aria-label="Filter by severity">
+          <FilterChip active={filter === null} onClick={() => setFilter(null)} count={findings.length}>
+            All
+          </FilterChip>
           {SEVERITIES.map((severity) => (
-            <button
+            <FilterChip
               key={severity}
-              type="button"
+              active={filter === severity}
               disabled={counts[severity] === 0}
               onClick={() => setFilter(severity)}
-              className={cx(
-                'rounded-lg border px-3 py-1 font-mono text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-30',
-                filter === severity
-                  ? SEVERITY_STYLES[severity].chip
-                  : 'border-white/10 bg-white/5 text-zinc-400 hover:text-zinc-200',
-              )}
+              count={counts[severity]}
+              activeClassName={SEVERITY_STYLES[severity].chip}
             >
-              {severity} <span className="ml-1 text-zinc-600">{counts[severity]}</span>
-            </button>
+              <span className="capitalize">{severity}</span>
+            </FilterChip>
           ))}
         </div>
 
         {visible.length === 0 ? (
-          <p className="p-4 text-sm text-zinc-500">
+          <p className="py-10 text-center text-sm text-zinc-400">
             {running
               ? 'Modules are still reporting — findings appear as their data lands.'
               : findings.length === 0
@@ -104,37 +102,27 @@ export function OverviewTab({
                 : 'No findings at this severity.'}
           </p>
         ) : (
-          <ul className="space-y-2">
+          <ul className="space-y-3">
             {visible.map((finding) => (
               <li
                 key={finding.id}
-                className={cx(
-                  'rounded-lg border-l-2 border-y border-r border-white/5 bg-black/20 p-3',
-                  finding.severity === 'critical'
-                    ? 'border-l-rose-500'
-                    : finding.severity === 'high'
-                      ? 'border-l-orange-500'
-                      : finding.severity === 'medium'
-                        ? 'border-l-amber-400'
-                        : finding.severity === 'low'
-                          ? 'border-l-sky-400'
-                          : 'border-l-zinc-600',
-                )}
+                className={cx(INSET, 'p-4 transition-colors hover:border-white/10')}
               >
-                <div className="flex flex-wrap items-center gap-2">
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
                   <SeverityBadge severity={finding.severity} />
                   <h4 className="text-sm font-semibold text-zinc-100">{finding.title}</h4>
                   <button
                     type="button"
                     onClick={() => onJump(finding.module)}
-                    className="ml-auto rounded-md border border-white/10 bg-white/5 px-2 py-0.5 font-mono text-[11px] text-zinc-400 transition-colors hover:border-emerald-500/40 hover:text-emerald-300"
+                    className="ml-auto inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium text-zinc-400 transition-colors hover:bg-white/5 hover:text-zinc-100"
                   >
-                    {MODULE_LABELS[finding.module]} →
+                    {MODULE_LABELS[finding.module]}
+                    <ArrowRightIcon className="size-3.5" />
                   </button>
                 </div>
-                <p className="mt-1.5 text-xs leading-relaxed text-zinc-400">{finding.detail}</p>
+                <p className="mt-2 text-sm leading-relaxed text-zinc-400">{finding.detail}</p>
                 {finding.evidence && (
-                  <pre className="mt-2 max-h-32 overflow-auto rounded bg-black/40 p-2 font-mono text-[11px] whitespace-pre-wrap text-zinc-500">
+                  <pre className="mt-3 max-h-32 overflow-auto rounded-md bg-zinc-950 p-3 font-mono text-xs leading-relaxed break-all whitespace-pre-wrap text-zinc-400 ring-1 ring-white/5 ring-inset">
                     {finding.evidence}
                   </pre>
                 )}
@@ -149,14 +137,14 @@ export function OverviewTab({
           title="Degraded modules"
           subtitle="One dead upstream never aborts a scan — these modules reported nothing usable."
         >
-          <ul className="space-y-1.5">
+          <DataList>
             {errored.map(([id, state]) => (
-              <li key={id} className="flex flex-wrap items-baseline gap-2 text-xs">
-                <span className="font-mono text-rose-300">{MODULE_LABELS[id]}</span>
-                <span className="text-zinc-500">{state.error}</span>
-              </li>
+              <DataRow key={id} className="flex-wrap gap-y-1">
+                <span className="text-sm font-medium text-rose-300">{MODULE_LABELS[id]}</span>
+                <span className="text-sm text-zinc-400">{state.error}</span>
+              </DataRow>
             ))}
-          </ul>
+          </DataList>
         </Panel>
       )}
     </div>

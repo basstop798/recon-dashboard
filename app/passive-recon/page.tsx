@@ -1,7 +1,7 @@
 'use client';
 
 /**
- * Unified Passive Recon Dashboard.
+ * BulletRecon dashboard.
  *
  * One input, one button, ten modules. The route streams NDJSON, so each
  * module's card flips from pending -> running -> done/failed independently and
@@ -33,9 +33,11 @@ import {
 import { ArchivedTab, SubdomainsTab, TakeoverTab, UrlIntelTab } from './components/surface-tabs';
 import { DnsTab, MailTab, WhoisTab } from './components/infra-tabs';
 import { JsTab, MetaTab, TechTab } from './components/app-tabs';
+import { AlertIcon, GlobeIcon, LogoMark } from './components/icons';
 import { OverviewTab } from './components/overview';
+import { TabBar } from './components/tab-bar';
 import { DorksTab, ExportTab, PivotsTab } from './components/toolkit';
-import { Panel, StatTile, StatusDot, cx } from './components/ui';
+import { CARD, CheckMark, INSET, LABEL, Panel, StatTile, StatusDot, cx } from './components/ui';
 
 type TabId = 'overview' | ModuleId | 'dorks' | 'pivots' | 'export';
 
@@ -55,6 +57,9 @@ const TABS: ReadonlyArray<{ id: TabId; label: string }> = [
   { id: 'pivots', label: 'Pivots' },
   { id: 'export', label: 'Export' },
 ];
+
+/** Shared by the app bar and the content column so their edges line up. */
+const CONTAINER = 'mx-auto w-full max-w-[96rem] px-4 sm:px-6 lg:px-8';
 
 function emptyModules(): ScanReport['modules'] {
   const base = {} as ScanReport['modules'];
@@ -80,7 +85,11 @@ function createReport(domain: string): ScanReport {
   };
 }
 
-export default function PassiveReconPage() {
+function isSettled(state: ModuleState): boolean {
+  return state.status === 'done' || state.status === 'error';
+}
+
+export default function BulletReconPage() {
   const [domain, setDomain] = useState('');
   const [report, setReport] = useState<ScanReport | null>(null);
   const [running, setRunning] = useState(false);
@@ -88,10 +97,27 @@ export default function PassiveReconPage() {
   const [tab, setTab] = useState<TabId>('overview');
 
   const abortRef = useRef<AbortController | null>(null);
+  const resultsRef = useRef<HTMLElement>(null);
 
   // A scan that is still streaming when the operator navigates away should stop
   // rather than keep the connection (and the server's work) alive.
   useEffect(() => () => abortRef.current?.abort(), []);
+
+  /**
+   * Switches tab. Tabs differ wildly in length, so once the operator has
+   * scrolled past the tab bar the view returns to the top of the new tab
+   * instead of wherever the old one left it. `reveal` forces that scroll, for
+   * jumps that start outside the tab area.
+   */
+  const selectTab = useCallback((id: TabId, reveal = false) => {
+    setTab(id);
+    const section = resultsRef.current;
+    if (section && (reveal || section.getBoundingClientRect().top < 0)) {
+      section.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  }, []);
+
+  const jumpTo = useCallback((id: ModuleId) => selectTab(id, true), [selectTab]);
 
   const applyEvent = useCallback((event: ScanEvent) => {
     setReport((current) => {
@@ -246,10 +272,8 @@ export default function PassiveReconPage() {
   const js = modules?.['js-endpoints'].data;
   const meta = modules?.meta.data;
 
-  const completed = report
-    ? MODULE_IDS.filter((id) => report.modules[id].status === 'done' || report.modules[id].status === 'error')
-        .length
-    : 0;
+  const completed = report ? MODULE_IDS.filter((id) => isSettled(report.modules[id])).length : 0;
+  const severe = counts.critical + counts.high;
 
   const tabCounts: Record<TabId, number> = {
     overview: findings.length,
@@ -273,184 +297,185 @@ export default function PassiveReconPage() {
   };
 
   return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-100">
-      {/* Backdrop: one subtle emerald wash so the page reads as a tool, not a form. */}
+    <div className="relative min-h-screen bg-zinc-950 text-zinc-100">
+      {/* One faint, neutral light source at the top — depth without colour. */}
       <div
         aria-hidden
-        className="pointer-events-none fixed inset-0 bg-[radial-gradient(60rem_40rem_at_50%_-10%,rgba(16,185,129,0.10),transparent)]"
+        className="pointer-events-none absolute inset-x-0 top-0 h-144 bg-[radial-gradient(ellipse_60%_50%_at_50%_-10%,rgb(255_255_255/0.06),transparent)]"
       />
 
-      <div className="relative mx-auto max-w-7xl px-4 py-6 sm:px-6">
-        <header className="mb-6">
-          <div className="flex flex-wrap items-end justify-between gap-3">
-            <div>
-              <h1 className="text-2xl font-bold tracking-tight sm:text-3xl">
-                <span className="text-emerald-400">Passive</span>Recon
-              </h1>
-              <p className="mt-1 text-sm text-zinc-400">
-                One click, ten OSINT modules, zero active probing.
-              </p>
-            </div>
-
-            {report && (
-              <div className="text-right font-mono text-xs text-zinc-500">
-                <p className="text-emerald-300">{report.domain}</p>
-                <p>
-                  {completed}/{MODULE_IDS.length} modules
-                  {report.durationMs !== null && ` · ${formatDuration(report.durationMs)}`}
-                </p>
-              </div>
-            )}
+      <header className="relative border-b border-white/10">
+        <div className={cx(CONTAINER, 'flex h-16 items-center justify-between gap-4')}>
+          <div className="flex items-center gap-3">
+            <span className="flex size-9 items-center justify-center rounded-lg bg-emerald-500/10 text-emerald-400 ring-1 ring-emerald-500/25 ring-inset">
+              <LogoMark className="size-5" />
+            </span>
+            <h1 className="text-lg font-semibold tracking-tight text-zinc-50">
+              Bullet<span className="text-zinc-400">Recon</span>
+            </h1>
+            <span className="hidden rounded-full bg-white/5 px-2.5 py-0.5 text-xs font-medium text-zinc-400 ring-1 ring-white/10 ring-inset sm:inline-flex">
+              Passive OSINT
+            </span>
           </div>
+          <p className="hidden text-sm text-zinc-500 md:block">
+            One click, ten OSINT modules, zero active probing.
+          </p>
+        </div>
+      </header>
 
-          <form onSubmit={handleScan} className="mt-4 flex flex-wrap gap-2">
-            <input
-              type="text"
-              value={domain}
-              onChange={(event) => setDomain(event.target.value)}
-              placeholder="target domain — example.com"
-              aria-label="Target domain"
-              autoComplete="off"
-              spellCheck={false}
-              className="min-w-64 flex-1 rounded-xl border border-white/10 bg-black/40 px-4 py-3 font-mono text-sm text-zinc-100 placeholder:text-zinc-600 focus:border-emerald-500/60 focus:ring-1 focus:ring-emerald-500/40 focus:outline-none"
-            />
+      <div className={cx(CONTAINER, 'relative space-y-6 py-8')}>
+        <section className={cx(CARD, 'p-5 sm:p-6')}>
+          <form onSubmit={handleScan}>
+            <label htmlFor="target-domain" className={cx(LABEL, 'mb-2.5 block')}>
+              Target domain
+            </label>
+            <div className="flex flex-col gap-3 sm:flex-row">
+              <div className="relative min-w-0 flex-1">
+                <GlobeIcon className="pointer-events-none absolute top-1/2 left-4 size-4 -translate-y-1/2 text-zinc-500" />
+                <input
+                  id="target-domain"
+                  type="text"
+                  value={domain}
+                  onChange={(event) => setDomain(event.target.value)}
+                  placeholder="example.com"
+                  autoComplete="off"
+                  spellCheck={false}
+                  className="h-12 w-full rounded-lg bg-zinc-950 pr-4 pl-11 font-mono text-sm text-zinc-100 ring-1 ring-white/10 transition-shadow ring-inset placeholder:text-zinc-600 focus:ring-2 focus:ring-emerald-500/50 focus:outline-none"
+                />
+              </div>
 
-            <button
-              type="submit"
-              disabled={running}
-              className={cx(
-                'rounded-xl px-6 py-3 text-sm font-semibold transition-colors',
-                running
-                  ? 'cursor-not-allowed bg-zinc-800 text-zinc-500'
-                  : 'bg-emerald-500 text-zinc-950 shadow-[0_0_24px_rgba(16,185,129,0.25)] hover:bg-emerald-400',
-              )}
-            >
-              {running ? 'Scanning…' : 'Run full passive scan'}
-            </button>
-
-            {running && (
               <button
-                type="button"
-                onClick={cancelScan}
-                className="rounded-xl border border-rose-500/40 px-4 py-3 text-sm font-semibold text-rose-300 transition-colors hover:bg-rose-500/10"
+                type="submit"
+                disabled={running}
+                className="inline-flex h-12 items-center justify-center gap-2.5 rounded-lg bg-zinc-100 px-6 text-sm font-semibold text-zinc-900 shadow-sm transition-colors hover:bg-white focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-400 disabled:cursor-not-allowed disabled:bg-zinc-800 disabled:text-zinc-400"
               >
-                Cancel
+                {running && (
+                  <span className="size-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
+                )}
+                {running ? 'Scanning…' : 'Run full passive scan'}
               </button>
-            )}
+
+              {running && (
+                <button
+                  type="button"
+                  onClick={cancelScan}
+                  className="h-12 rounded-lg px-5 text-sm font-medium text-zinc-300 ring-1 ring-white/10 transition-colors ring-inset hover:bg-rose-500/10 hover:text-rose-300 hover:ring-rose-500/30"
+                >
+                  Cancel
+                </button>
+              )}
+            </div>
           </form>
 
-          {report && (
-            <div className="mt-3 h-1 w-full overflow-hidden rounded-full bg-white/5">
-              <div
-                className="h-full rounded-full bg-emerald-500 transition-[width] duration-500"
-                style={{ width: `${(completed / MODULE_IDS.length) * 100}%` }}
-              />
-            </div>
-          )}
-
           {fatalError && (
-            <div className="mt-3 rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-300">
+            <div
+              role="alert"
+              className="mt-4 flex items-start gap-3 rounded-lg bg-rose-500/10 px-4 py-3 text-sm text-rose-300 ring-1 ring-rose-500/20 ring-inset"
+            >
+              <AlertIcon className="mt-0.5 size-4 shrink-0" />
               {fatalError}
             </div>
           )}
-        </header>
+        </section>
 
         {!report ? (
           <IntroPanels />
         ) : (
           <>
-            <section className="mb-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
-              <StatTile
-                label="Findings"
-                value={findings.length}
-                tone={counts.critical + counts.high > 0 ? 'high' : 'default'}
-                hint={`${counts.critical + counts.high} high or worse`}
-              />
-              <StatTile label="Hosts" value={subdomains?.subdomains.length ?? 0} tone="accent" />
-              <StatTile label="Live hosts" value={takeover?.live ?? 0} hint={`${takeover?.checked ?? 0} resolved`} />
-              <StatTile
-                label="URLs"
-                value={(modules?.archived.data?.urls.length ?? 0).toLocaleString()}
-                hint={`${urlIntel?.analyzed.toLocaleString() ?? 0} analysed`}
-              />
-              <StatTile label="Parameters" value={urlIntel?.parameters.length ?? 0} />
-              <StatTile
-                label="Secrets"
-                value={js?.secrets.length ?? 0}
-                tone={(js?.secrets.length ?? 0) > 0 ? 'critical' : 'default'}
-              />
+            <section className="grid gap-4 lg:grid-cols-3">
+              <TargetCard report={report} completed={completed} running={running} />
+
+              <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:col-span-2">
+                <StatTile
+                  label="Findings"
+                  value={findings.length}
+                  tone={severe > 0 ? 'high' : 'default'}
+                  hint={`${severe} high or worse`}
+                />
+                <StatTile
+                  label="Hosts"
+                  value={(subdomains?.subdomains.length ?? 0).toLocaleString()}
+                  tone="accent"
+                  hint="unique subdomains"
+                />
+                <StatTile
+                  label="Live hosts"
+                  value={(takeover?.live ?? 0).toLocaleString()}
+                  hint={`${takeover?.checked ?? 0} resolved`}
+                />
+                <StatTile
+                  label="URLs"
+                  value={(modules?.archived.data?.urls.length ?? 0).toLocaleString()}
+                  hint={`${urlIntel?.analyzed.toLocaleString() ?? 0} analysed`}
+                />
+                <StatTile
+                  label="Parameters"
+                  value={(urlIntel?.parameters.length ?? 0).toLocaleString()}
+                  hint="unique names"
+                />
+                <StatTile
+                  label="Secrets"
+                  value={js?.secrets.length ?? 0}
+                  tone={(js?.secrets.length ?? 0) > 0 ? 'critical' : 'default'}
+                  hint="credential patterns"
+                />
+              </div>
             </section>
 
-            <ModuleStrip report={report} />
+            <ModuleGroups report={report} onJump={jumpTo} />
 
-            <nav className="sticky top-0 z-10 -mx-4 mb-4 overflow-x-auto border-b border-white/10 bg-zinc-950/85 px-4 backdrop-blur sm:-mx-6 sm:px-6">
-              <div className="flex gap-1">
-                {TABS.map((item) => (
-                  <button
-                    key={item.id}
-                    type="button"
-                    onClick={() => setTab(item.id)}
-                    className={cx(
-                      'relative shrink-0 px-3 py-3 text-sm transition-colors',
-                      tab === item.id
-                        ? 'font-semibold text-emerald-300'
-                        : 'text-zinc-500 hover:text-zinc-300',
-                    )}
-                  >
-                    {item.label}
-                    {tabCounts[item.id] > 0 && (
-                      <span className="ml-1.5 rounded bg-white/5 px-1.5 py-0.5 font-mono text-[10px] text-zinc-400">
-                        {tabCounts[item.id]}
-                      </span>
-                    )}
-                    {tab === item.id && (
-                      <span className="absolute inset-x-2 -bottom-px h-0.5 rounded-full bg-emerald-400" />
-                    )}
-                  </button>
-                ))}
-              </div>
-            </nav>
-
-            <main className="pb-16">
-              {tab === 'overview' && (
-                <OverviewTab
-                  report={report}
-                  findings={findings}
-                  counts={counts}
-                  onJump={setTab}
-                  running={running}
+            <section ref={resultsRef} className="scroll-mt-2">
+              <div className="sticky top-0 z-20 -mx-4 mb-6 bg-zinc-950/80 px-4 py-3 backdrop-blur-md sm:-mx-6 sm:px-6 lg:-mx-8 lg:px-8">
+                <TabBar
+                  tabs={TABS.map((item) => ({ ...item, count: tabCounts[item.id] }))}
+                  active={tab}
+                  onChange={selectTab}
                 />
-              )}
-              {tab === 'subdomains' && (
-                <SubdomainsTab state={report.modules.subdomains} data={subdomains ?? null} />
-              )}
-              {tab === 'takeover' && (
-                <TakeoverTab state={report.modules.takeover} data={takeover ?? null} />
-              )}
-              {tab === 'url-intel' && (
-                <UrlIntelTab state={report.modules['url-intel']} data={urlIntel ?? null} />
-              )}
-              {tab === 'dns' && <DnsTab state={report.modules.dns} data={report.modules.dns.data} />}
-              {tab === 'mail' && (
-                <MailTab state={report.modules.mail} data={report.modules.mail.data} />
-              )}
-              {tab === 'whois' && (
-                <WhoisTab state={report.modules.whois} data={report.modules.whois.data} />
-              )}
-              {tab === 'tech' && (
-                <TechTab state={report.modules.tech} data={report.modules.tech.data} />
-              )}
-              {tab === 'js-endpoints' && (
-                <JsTab state={report.modules['js-endpoints']} data={js ?? null} />
-              )}
-              {tab === 'archived' && (
-                <ArchivedTab state={report.modules.archived} data={report.modules.archived.data} />
-              )}
-              {tab === 'meta' && <MetaTab state={report.modules.meta} data={meta ?? null} />}
-              {tab === 'dorks' && <DorksTab groups={dorks} />}
-              {tab === 'pivots' && <PivotsTab groups={pivots} />}
-              {tab === 'export' && <ExportTab report={report} />}
-            </main>
+              </div>
+
+              <main role="tabpanel" className="pb-16">
+                {tab === 'overview' && (
+                  <OverviewTab
+                    report={report}
+                    findings={findings}
+                    counts={counts}
+                    onJump={jumpTo}
+                    running={running}
+                  />
+                )}
+                {tab === 'subdomains' && (
+                  <SubdomainsTab state={report.modules.subdomains} data={subdomains ?? null} />
+                )}
+                {tab === 'takeover' && (
+                  <TakeoverTab state={report.modules.takeover} data={takeover ?? null} />
+                )}
+                {tab === 'url-intel' && (
+                  <UrlIntelTab state={report.modules['url-intel']} data={urlIntel ?? null} />
+                )}
+                {tab === 'dns' && (
+                  <DnsTab state={report.modules.dns} data={report.modules.dns.data} />
+                )}
+                {tab === 'mail' && (
+                  <MailTab state={report.modules.mail} data={report.modules.mail.data} />
+                )}
+                {tab === 'whois' && (
+                  <WhoisTab state={report.modules.whois} data={report.modules.whois.data} />
+                )}
+                {tab === 'tech' && (
+                  <TechTab state={report.modules.tech} data={report.modules.tech.data} />
+                )}
+                {tab === 'js-endpoints' && (
+                  <JsTab state={report.modules['js-endpoints']} data={js ?? null} />
+                )}
+                {tab === 'archived' && (
+                  <ArchivedTab state={report.modules.archived} data={report.modules.archived.data} />
+                )}
+                {tab === 'meta' && <MetaTab state={report.modules.meta} data={meta ?? null} />}
+                {tab === 'dorks' && <DorksTab groups={dorks} />}
+                {tab === 'pivots' && <PivotsTab groups={pivots} />}
+                {tab === 'export' && <ExportTab report={report} />}
+              </main>
+            </section>
           </>
         )}
       </div>
@@ -459,80 +484,206 @@ export default function PassiveReconPage() {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Static sections                                                            */
+/* Summary cards                                                              */
 /* -------------------------------------------------------------------------- */
 
-function ModuleStrip({ report }: { report: ScanReport }) {
+function TargetCard({
+  report,
+  completed,
+  running,
+}: {
+  report: ScanReport;
+  completed: number;
+  running: boolean;
+}) {
+  const status = running
+    ? { label: 'Scanning', chip: 'bg-sky-500/10 text-sky-300 ring-sky-500/20', dot: 'bg-sky-400 animate-pulse' }
+    : report.finishedAt
+      ? { label: 'Complete', chip: 'bg-emerald-500/10 text-emerald-300 ring-emerald-500/20', dot: 'bg-emerald-400' }
+      : { label: 'Incomplete', chip: 'bg-amber-500/10 text-amber-300 ring-amber-500/20', dot: 'bg-amber-400' };
+
+  const started = new Date(report.startedAt).toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+
   return (
-    <section className="mb-5 grid gap-3 lg:grid-cols-3">
-      {MODULE_GROUPS.map((group) => (
-        <div key={group.label} className="rounded-xl border border-white/8 bg-zinc-900/40 p-3">
-          <p className="mb-2 text-[11px] font-medium tracking-wider text-zinc-500 uppercase">
-            {group.label}
-          </p>
-          <ul className="space-y-1.5">
-            {group.modules.map((id) => {
-              const state = report.modules[id];
-              return (
-                <li key={id} className="flex items-center gap-2">
-                  <StatusDot status={state.status} />
-                  <span className="text-xs text-zinc-300">{MODULE_LABELS[id]}</span>
-                  <span className="ml-auto shrink-0 font-mono text-[10px] text-zinc-600">
-                    {state.status === 'done' && formatDuration(state.durationMs)}
-                    {state.status === 'running' && 'running'}
-                    {state.status === 'error' && <span className="text-rose-400">failed</span>}
-                    {state.status === 'pending' && 'queued'}
-                  </span>
-                </li>
-              );
-            })}
-          </ul>
+    <div className={cx(CARD, 'flex flex-col p-6')}>
+      <div className="flex items-center justify-between gap-3">
+        <p className={LABEL}>Target</p>
+        <span
+          className={cx(
+            'inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium ring-1 ring-inset',
+            status.chip,
+          )}
+        >
+          <span className={cx('size-1.5 rounded-full', status.dot)} />
+          {status.label}
+        </span>
+      </div>
+
+      <p className="mt-3 font-mono text-2xl font-semibold tracking-tight break-all text-zinc-50">
+        {report.domain}
+      </p>
+
+      <dl className="mt-6 grid grid-cols-3 gap-4">
+        <div>
+          <dt className={LABEL}>Modules</dt>
+          <dd className="mt-1.5 text-lg font-semibold text-zinc-100 tabular-nums">
+            {completed}
+            <span className="text-zinc-500">/{MODULE_IDS.length}</span>
+          </dd>
         </div>
-      ))}
+        <div>
+          <dt className={LABEL}>Duration</dt>
+          <dd className="mt-1.5 text-lg font-semibold text-zinc-100 tabular-nums">
+            {report.durationMs !== null ? formatDuration(report.durationMs) : '—'}
+          </dd>
+        </div>
+        <div>
+          <dt className={LABEL}>Started</dt>
+          <dd className="mt-1.5 text-lg font-semibold text-zinc-100 tabular-nums">{started}</dd>
+        </div>
+      </dl>
+
+      <div className="mt-auto pt-6">
+        <div
+          role="progressbar"
+          aria-label="Modules completed"
+          aria-valuemin={0}
+          aria-valuemax={MODULE_IDS.length}
+          aria-valuenow={completed}
+          className="h-1.5 overflow-hidden rounded-full bg-white/5"
+        >
+          <div
+            className="h-full rounded-full bg-emerald-400/80 transition-[width] duration-500"
+            style={{ width: `${(completed / MODULE_IDS.length) * 100}%` }}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ModuleGroups({
+  report,
+  onJump,
+}: {
+  report: ScanReport;
+  onJump: (id: ModuleId) => void;
+}) {
+  return (
+    <section className="grid gap-4 lg:grid-cols-3">
+      {MODULE_GROUPS.map((group) => {
+        const settled = group.modules.filter((id) => isSettled(report.modules[id])).length;
+
+        return (
+          <div key={group.label} className={cx(CARD, 'p-5')}>
+            <div className="mb-3 flex items-center justify-between">
+              <h2 className={LABEL}>{group.label}</h2>
+              <span className="text-xs text-zinc-500 tabular-nums">
+                {settled}/{group.modules.length}
+              </span>
+            </div>
+
+            <ul className="-mx-2 space-y-0.5">
+              {group.modules.map((id) => {
+                const state = report.modules[id];
+                return (
+                  <li key={id}>
+                    <button
+                      type="button"
+                      onClick={() => onJump(id)}
+                      className="flex w-full items-center gap-3 rounded-lg px-2 py-2 text-left transition-colors hover:bg-white/5"
+                    >
+                      <StatusDot status={state.status} />
+                      <span className="text-sm text-zinc-200">{MODULE_LABELS[id]}</span>
+                      <span className="ml-auto shrink-0 text-xs tabular-nums">
+                        {state.status === 'done' && (
+                          <span className="text-zinc-500">{formatDuration(state.durationMs)}</span>
+                        )}
+                        {state.status === 'running' && (
+                          <span className="text-emerald-400">Running</span>
+                        )}
+                        {state.status === 'error' && <span className="text-rose-400">Failed</span>}
+                        {state.status === 'pending' && <span className="text-zinc-600">Queued</span>}
+                      </span>
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        );
+      })}
     </section>
   );
 }
 
+/* -------------------------------------------------------------------------- */
+/* Static sections                                                            */
+/* -------------------------------------------------------------------------- */
+
 function IntroPanels() {
   return (
-    <div className="space-y-4">
+    <div className="space-y-6">
       <Panel
         title="What one click does"
         subtitle="Every module runs in parallel and streams its result as it lands."
       >
-        <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-          {MODULE_IDS.map((id) => (
-            <div key={id} className="rounded-lg border border-white/5 bg-black/20 p-3">
-              <p className="text-sm font-medium text-zinc-200">{MODULE_LABELS[id]}</p>
-              <p className="mt-1 text-[11px] leading-relaxed text-zinc-500">
-                {MODULE_DESCRIPTIONS[id]}
-              </p>
+        <div className="grid gap-6 lg:grid-cols-3">
+          {MODULE_GROUPS.map((group) => (
+            <div key={group.label}>
+              <h4 className={cx(LABEL, 'mb-3')}>{group.label}</h4>
+              <ul className="space-y-3">
+                {group.modules.map((id) => (
+                  <li key={id} className={cx(INSET, 'p-4')}>
+                    <p className="text-sm font-medium text-zinc-100">{MODULE_LABELS[id]}</p>
+                    <p className="mt-1 text-xs leading-relaxed text-zinc-400">
+                      {MODULE_DESCRIPTIONS[id]}
+                    </p>
+                  </li>
+                ))}
+              </ul>
             </div>
           ))}
         </div>
       </Panel>
 
       <Panel title="Passive means passive">
-        <ul className="space-y-2 text-sm leading-relaxed text-zinc-400">
-          <li>
-            <span className="text-emerald-300">OSINT indexes</span> are queried for data they
-            already hold — certificate transparency, passive DNS, web archives, RDAP.
+        <ul className="space-y-4 text-sm leading-relaxed text-zinc-400">
+          <li className="flex gap-3">
+            <CheckMark ok />
+            <p>
+              <span className="font-medium text-zinc-100">OSINT indexes</span> are queried for
+              data they already hold — certificate transparency, passive DNS, web archives, RDAP.
+            </p>
           </li>
-          <li>
-            <span className="text-emerald-300">DNS resolution</span> covers the apex and a capped
-            sweep of discovered hosts. These are ordinary recursive lookups, the same ones a
-            browser makes before opening any connection.
+          <li className="flex gap-3">
+            <CheckMark ok />
+            <p>
+              <span className="font-medium text-zinc-100">DNS resolution</span> covers the apex
+              and a capped sweep of discovered hosts. These are ordinary recursive lookups, the
+              same ones a browser makes before opening any connection.
+            </p>
           </li>
-          <li>
-            <span className="text-emerald-300">The target</span> receives one homepage GET, the
-            same-origin scripts it advertises, and a short fixed list of published files
-            (robots.txt, sitemap, security.txt, favicon, <code>/.well-known/*</code>). That is a
-            browser&apos;s first visit — never a wordlist.
+          <li className="flex gap-3">
+            <CheckMark ok />
+            <p>
+              <span className="font-medium text-zinc-100">The target</span> receives one homepage
+              GET, the same-origin scripts it advertises, and a short fixed list of published
+              files (robots.txt, sitemap, security.txt, favicon,{' '}
+              <code className="font-mono text-[13px] text-zinc-300">/.well-known/*</code>). That
+              is a browser&apos;s first visit — never a wordlist.
+            </p>
           </li>
-          <li>
-            <span className="text-rose-300">No</span> port scanning, directory brute-forcing or
-            parameter fuzzing. Wordlists are exported for your own tooling, because you own the
-            authorisation that makes active testing legal.
+          <li className="flex gap-3">
+            <CheckMark ok={false} />
+            <p>
+              <span className="font-medium text-rose-300">No</span> port scanning, directory
+              brute-forcing or parameter fuzzing. Wordlists are exported for your own tooling,
+              because you own the authorisation that makes active testing legal.
+            </p>
           </li>
         </ul>
       </Panel>
