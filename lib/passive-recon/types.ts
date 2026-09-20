@@ -367,6 +367,13 @@ export interface FaviconPayload {
   /** Shodan-compatible `http.favicon.hash` value (signed int32). */
   hash: number | null;
   bytes: number | null;
+  /**
+   * The icon inlined as a `data:` URI, so the dashboard can show it without
+   * the operator's browser fetching it from the target — which would put the
+   * analyst's own IP in the target's logs. Null when the icon is missing or
+   * too large to be worth inlining.
+   */
+  dataUri: string | null;
 }
 
 export interface WellKnownFile {

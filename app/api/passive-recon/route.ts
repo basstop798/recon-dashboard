@@ -108,8 +108,12 @@ import {
 
 // `node:dns` in the SSRF guard requires the Node runtime, not Edge.
 export const runtime = 'nodejs';
-// Allows the slowest OSINT index to finish on platforms that cap execution.
-export const maxDuration = 120;
+/**
+ * 60s is the ceiling on Vercel's Hobby plan, and a value above a platform's cap
+ * is a deploy-time error rather than a clamp. Self-hosting has no such cap:
+ * raise this to 120 there if a slow OSINT index is getting cut off.
+ */
+export const maxDuration = 60;
 
 const USER_AGENT =
   'Mozilla/5.0 (compatible; BulletReconDashboard/2.0; +passive-osint)';
@@ -258,42 +262,111 @@ interface FetchOptions {
   accept?: string;
 }
 
-/** The shared request itself; callers decide how to drain the body. */
+/** Hops allowed before a redirect chain is treated as hostile or broken. */
+const MAX_REDIRECTS = 5;
+
+function isRedirectStatus(status: number): boolean {
+  return status === 301 || status === 302 || status === 303 || status === 307 || status === 308;
+}
+
+/** Frees the socket for a response whose body we are never going to read. */
+async function discard(response: Response): Promise<void> {
+  try {
+    await response.body?.cancel();
+  } catch {
+    // Already consumed or already errored; nothing left to release.
+  }
+}
+
+interface FetchResult {
+  response: Response;
+  /** The URL that actually served the body, after any redirects. */
+  finalUrl: string;
+  redirected: boolean;
+}
+
+/**
+ * The shared request itself; callers decide how to drain the body.
+ *
+ * Redirects are followed by hand so that `assertPublicHost` runs on *every*
+ * hop. Handing that to `redirect: 'follow'` was an SSRF hole: the gate in
+ * `POST` only ever validates the domain the operator typed, so a target whose
+ * homepage answered `302 http://169.254.169.254/` walked the fetch straight
+ * into cloud metadata — and the body came back through the tech/JS modules,
+ * which parse and display it. The same applies to any internal host reachable
+ * from wherever this is deployed.
+ */
 async function performFetch(
   url: string,
   { parentSignal, timeoutMs, accept }: FetchOptions,
-): Promise<Response> {
+): Promise<FetchResult> {
   // Either the client hanging up or our own deadline cancels the request, so a
-  // stalled upstream can never pin the connection open.
+  // stalled upstream can never pin the connection open. One signal covers the
+  // whole redirect chain, so hops cannot be used to extend the deadline.
   const signal = AbortSignal.any([parentSignal, AbortSignal.timeout(timeoutMs)]);
 
-  return fetch(url, {
-    method: 'GET',
-    redirect: 'follow',
-    signal,
-    cache: 'no-store',
-    headers: {
-      'User-Agent': USER_AGENT,
-      Accept: accept ?? '*/*',
-      'Accept-Language': 'en-US,en;q=0.9',
-    },
-  });
+  let current = url;
+
+  for (let hop = 0; ; hop += 1) {
+    const guard = await assertPublicHost(new URL(current).hostname);
+    if (!guard.ok) throw new Error(guard.error);
+
+    const response = await fetch(current, {
+      method: 'GET',
+      redirect: 'manual',
+      signal,
+      cache: 'no-store',
+      headers: {
+        'User-Agent': USER_AGENT,
+        Accept: accept ?? '*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+    });
+
+    const location = response.headers.get('location');
+    if (!isRedirectStatus(response.status) || !location) {
+      return { response, finalUrl: current, redirected: hop > 0 };
+    }
+
+    if (hop >= MAX_REDIRECTS) {
+      await discard(response);
+      throw new Error(`More than ${MAX_REDIRECTS} redirects from ${url}.`);
+    }
+
+    let next: URL;
+    try {
+      next = new URL(location, current);
+    } catch {
+      await discard(response);
+      throw new Error(`Invalid redirect target "${location}" from ${current}.`);
+    }
+
+    // `data:`, `file:` and friends are never a legitimate redirect for a web
+    // page, and each one is a different way to sidestep the host check above.
+    if (next.protocol !== 'https:' && next.protocol !== 'http:') {
+      await discard(response);
+      throw new Error(`Refusing to follow a "${next.protocol}" redirect from ${current}.`);
+    }
+
+    await discard(response);
+    current = next.toString();
+  }
 }
 
 async function fetchText(
   url: string,
   options: FetchOptions,
-): Promise<{ response: Response; text: string }> {
-  const response = await performFetch(url, options);
-  return { response, text: await readCapped(response, options.maxBytes) };
+): Promise<FetchResult & { text: string }> {
+  const result = await performFetch(url, options);
+  return { ...result, text: await readCapped(result.response, options.maxBytes) };
 }
 
 async function fetchBytes(
   url: string,
   options: FetchOptions,
-): Promise<{ response: Response; bytes: Uint8Array }> {
-  const response = await performFetch(url, options);
-  return { response, bytes: await readCappedBytes(response, options.maxBytes) };
+): Promise<FetchResult & { bytes: Uint8Array }> {
+  const result = await performFetch(url, options);
+  return { ...result, bytes: await readCappedBytes(result.response, options.maxBytes) };
 }
 
 /** Fetches JSON with the byte cap intact, and a clear error when it is not JSON. */
@@ -717,7 +790,7 @@ async function collectArchivedUrls(
 /* -------------------------------------------------------------------------- */
 
 type HomepageResult =
-  | { ok: true; response: Response; html: string; finalUrl: string }
+  | { ok: true; response: Response; html: string; finalUrl: string; redirected: boolean }
   | { ok: false; error: string };
 
 /**
@@ -733,7 +806,7 @@ async function fetchHomepage(
   parentSignal: AbortSignal,
 ): Promise<HomepageResult> {
   try {
-    const { response, text } = await fetchText(`https://${domain}/`, {
+    const { response, text, finalUrl, redirected } = await fetchText(`https://${domain}/`, {
       parentSignal,
       timeoutMs: TIMEOUTS.target,
       maxBytes: LIMITS.htmlBytes,
@@ -744,7 +817,10 @@ async function fetchHomepage(
       ok: true,
       response,
       html: text,
-      finalUrl: response.url || `https://${domain}/`,
+      // `redirect: 'manual'` leaves `response.url` empty, so the hop-walking
+      // fetch reports where the body actually came from.
+      finalUrl,
+      redirected,
     };
   } catch (error) {
     return { ok: false, error: toMessage(error) };
@@ -892,7 +968,7 @@ async function fingerprintTech(homepage: Promise<HomepageResult>): Promise<TechP
   const result = await homepage;
   if (!result.ok) throw new Error(result.error);
 
-  const { response, html, finalUrl } = result;
+  const { response, html, finalUrl, redirected } = result;
   const found = new Map<string, Technology>();
 
   const add = (tech: Technology) => {
@@ -952,7 +1028,7 @@ async function fingerprintTech(homepage: Promise<HomepageResult>): Promise<TechP
   return {
     finalUrl,
     status: response.status,
-    redirected: response.redirected,
+    redirected,
     technologies: [...found.values()].sort(
       (a, b) => a.category.localeCompare(b.category) || a.name.localeCompare(b.name),
     ),
@@ -1181,6 +1257,7 @@ async function fetchFavicon(
     url: null,
     hash: null,
     bytes: null,
+    dataUri: null,
   };
 
   if (!homepage.ok) return missing;
@@ -1210,10 +1287,34 @@ async function fetchFavicon(
       url,
       hash: shodanFaviconHash(bytes),
       bytes: bytes.length,
+      dataUri: toDataUri(bytes, response.headers.get('content-type')),
     };
   } catch {
     return { ...missing, url };
   }
+}
+
+/** Icons above this are shown from their URL instead of inlined. */
+const MAX_INLINE_FAVICON_BYTES = 64_000;
+
+/**
+ * Inlines the icon the server already fetched.
+ *
+ * Without this the dashboard would render `<img src="https://target/...">` and
+ * the analyst's own browser would connect to the host they are researching —
+ * putting their residential IP in that host's access log, which is exactly what
+ * a passive tool must not do. The bytes are in hand anyway, since the Shodan
+ * hash is computed from them.
+ */
+function toDataUri(bytes: Uint8Array, contentType: string | null): string | null {
+  if (bytes.length === 0 || bytes.length > MAX_INLINE_FAVICON_BYTES) return null;
+
+  // Target-controlled header: allow only image types, and never a `;` that
+  // could close the media type and smuggle attributes into the URI.
+  const declared = (contentType ?? '').split(';')[0].trim().toLowerCase();
+  const mediaType = /^image\/[a-z0-9.+-]+$/.test(declared) ? declared : 'image/x-icon';
+
+  return `data:${mediaType};base64,${Buffer.from(bytes).toString('base64')}`;
 }
 
 /**
@@ -1506,7 +1607,7 @@ export async function POST(request: NextRequest): Promise<Response> {
       {
         error:
           'Cross-site requests are not accepted. Use the dashboard on this origin, ' +
-          'or set PASSIVE_RECON_ALLOWED_ORIGINS if you front it with another host.',
+          'or set BULLETRECON_ALLOWED_ORIGINS if you front it with another host.',
       },
       { status: 403 },
     );

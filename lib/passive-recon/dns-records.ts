@@ -13,7 +13,7 @@ import { cymruOriginQuery, parseCymruAsName, parseCymruOrigin } from './whois-in
 import { NULL_MX, type DnsPayload, type DnsRecord, type HostResolution, type SourceStat } from './types';
 
 /**
- * Comma-separated resolver IPs, e.g. `PASSIVE_RECON_DNS_SERVERS=1.1.1.1,8.8.8.8`.
+ * Comma-separated resolver IPs, e.g. `BULLETRECON_DNS_SERVERS=1.1.1.1,8.8.8.8`.
  *
  * Opt-in by design. `resolve*` uses c-ares, which reads its own nameserver
  * config rather than the OS resolver, and on some hosts (containers with a
@@ -25,7 +25,7 @@ import { NULL_MX, type DnsPayload, type DnsRecord, type HostResolution, type Sou
  * operator's scope list to whoever runs that resolver. Operators who want that
  * trade can ask for it explicitly.
  */
-const DNS_SERVERS_ENV = 'PASSIVE_RECON_DNS_SERVERS';
+const DNS_SERVERS_ENV = 'BULLETRECON_DNS_SERVERS';
 
 /**
  * Node's resolver applies its own retry/backoff, which can outlast the scan if
@@ -62,7 +62,11 @@ function toMessage(error: unknown): string {
 /** Builds a private resolver so we never mutate global DNS state. */
 function createResolver(): Resolver {
   const resolver = new Resolver();
-  const configured = process.env[DNS_SERVERS_ENV]?.trim();
+  // The `PASSIVE_RECON_` name predates the BulletRecon rename and still works,
+  // so an existing deployment's resolver config does not silently stop applying.
+  const configured = (
+    process.env[DNS_SERVERS_ENV] ?? process.env.PASSIVE_RECON_DNS_SERVERS
+  )?.trim();
 
   if (configured) {
     const servers = configured

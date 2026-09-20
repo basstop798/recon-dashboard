@@ -371,14 +371,21 @@ export function MetaTab({ state, data }: { state: ModuleState; data: MetaPayload
         <Panel title="Favicon hash" subtitle="Shodan-compatible mmh3 hash for infrastructure pivoting.">
           {favicon.found && favicon.url ? (
             <div className="flex items-start gap-4">
-              {/* eslint-disable-next-line @next/next/no-img-element -- next/image needs a remotePatterns entry per host, and the scanned host is arbitrary and only known at scan time. */}
-              <img
-                src={favicon.url}
-                alt="Target favicon"
-                width={48}
-                height={48}
-                className="size-12 shrink-0 rounded-lg bg-zinc-950 object-contain p-2 ring-1 ring-white/10 ring-inset"
-              />
+              {/* The server inlines the icon it already fetched, so this never
+                  reaches out to the target from the operator's browser. When it
+                  is too large to inline, no image is shown — the hash below is
+                  the part that matters, and a live fetch would leak the
+                  analyst's IP to the host under research. */}
+              {favicon.dataUri && (
+                /* eslint-disable-next-line @next/next/no-img-element -- a data: URI has no host for next/image to optimise. */
+                <img
+                  src={favicon.dataUri}
+                  alt="Target favicon"
+                  width={48}
+                  height={48}
+                  className="size-12 shrink-0 rounded-lg bg-zinc-950 object-contain p-2 ring-1 ring-white/10 ring-inset"
+                />
+              )}
               <div className="min-w-0 flex-1">
                 <div className="flex flex-wrap items-center gap-2">
                   <code className="rounded-md bg-zinc-950 px-2.5 py-1 font-mono text-[13px] text-emerald-300 ring-1 ring-white/5 ring-inset">

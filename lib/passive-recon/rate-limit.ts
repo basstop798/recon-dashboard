@@ -56,12 +56,21 @@ function positiveInt(raw: string | undefined, fallback: number): number {
   return Number.isInteger(value) && value > 0 ? value : fallback;
 }
 
+/**
+ * Reads `BULLETRECON_<name>`, falling back to the original `PASSIVE_RECON_`
+ * prefix so a deployment configured before the rename keeps working. New
+ * deployments should use the `BULLETRECON_` names.
+ */
+export function envValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
+  return env[`BULLETRECON_${name}`] ?? env[`PASSIVE_RECON_${name}`];
+}
+
 export function readGateConfig(env: NodeJS.ProcessEnv = process.env): GateConfig {
   return {
-    perClient: positiveInt(env.PASSIVE_RECON_RATE_PER_CLIENT, DEFAULT_CONFIG.perClient),
-    perInstance: positiveInt(env.PASSIVE_RECON_RATE_PER_INSTANCE, DEFAULT_CONFIG.perInstance),
-    windowMs: positiveInt(env.PASSIVE_RECON_RATE_WINDOW_MS, DEFAULT_CONFIG.windowMs),
-    maxConcurrent: positiveInt(env.PASSIVE_RECON_MAX_CONCURRENT, DEFAULT_CONFIG.maxConcurrent),
+    perClient: positiveInt(envValue(env, 'RATE_PER_CLIENT'), DEFAULT_CONFIG.perClient),
+    perInstance: positiveInt(envValue(env, 'RATE_PER_INSTANCE'), DEFAULT_CONFIG.perInstance),
+    windowMs: positiveInt(envValue(env, 'RATE_WINDOW_MS'), DEFAULT_CONFIG.windowMs),
+    maxConcurrent: positiveInt(envValue(env, 'MAX_CONCURRENT'), DEFAULT_CONFIG.maxConcurrent),
   };
 }
 
@@ -107,7 +116,7 @@ function bucketAddress(address: string): string {
  * from a forwarding header. Those are attacker-controlled unless a proxy you
  * trust overwrites them — which is why the global window and the concurrency
  * cap, neither of which depends on client identity, are the real controls.
- * Set `PASSIVE_RECON_TRUST_PROXY=false` when the app is exposed directly to
+ * Set `BULLETRECON_TRUST_PROXY=false` when the app is exposed directly to
  * the internet: every client then shares one bucket, which is strict but
  * honest.
  */
@@ -115,7 +124,7 @@ export function clientKey(
   headers: Headers,
   env: NodeJS.ProcessEnv = process.env,
 ): string {
-  if (env.PASSIVE_RECON_TRUST_PROXY === 'false') return 'direct';
+  if (envValue(env, 'TRUST_PROXY') === 'false') return 'direct';
 
   const forwarded = headers.get('x-forwarded-for');
   if (forwarded) {
@@ -319,7 +328,7 @@ export function isAllowedOrigin(
 
   if (host && originHost === host.toLowerCase()) return true;
 
-  const allowed = env.PASSIVE_RECON_ALLOWED_ORIGINS?.split(',') ?? [];
+  const allowed = envValue(env, 'ALLOWED_ORIGINS')?.split(',') ?? [];
   return allowed.some((entry) => {
     const trimmed = entry.trim().toLowerCase();
     if (!trimmed) return false;
