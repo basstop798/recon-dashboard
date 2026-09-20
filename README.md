@@ -66,6 +66,29 @@ npm install
 npm run dev     # http://localhost:3000
 ```
 
+## Development
+
+```bash
+npm run lint           # ESLint
+npm test               # Vitest, single run
+npm run test:watch     # Vitest, watch mode
+npm run test:coverage  # Vitest with a v8 coverage report
+npm run build           # Next.js production build
+```
+
+Tests currently cover the four modules that gate what a public deployment is
+exposed to — `sanitizeDomain` (input validation), `net-guard` (the SSRF guard),
+`rate-limit` (abuse controls) and `proxy` (Basic auth) — at ~95%+ line
+coverage. `.github/workflows/ci.yml` runs lint, tests and the build on every
+push and pull request against `master`.
+
+The scan pipeline itself lives across `app/api/passive-recon/route.ts` (the
+orchestrator: gates, the NDJSON event stream, and wiring shared work — the one
+homepage fetch, DNS records — between modules) and
+`lib/passive-recon/modules/*.ts`, one file per module in the table above. The
+fetch primitives every module shares (byte caps, the redirect-safe SSRF-checked
+fetch, timeouts) live in `lib/passive-recon/scan-fetch.ts`.
+
 ### Configuration
 
 Every variable is optional; [`.env.example`](.env.example) is a copyable
@@ -222,3 +245,7 @@ Passive collection is not permission. Confirm the target is in scope for a
 programme you are authorised to test before acting on anything this tool
 surfaces — the Pivots tab links straight to the HackerOne, Bugcrowd,
 disclose.io and `security.txt` lookups for exactly that.
+
+## License
+
+[MIT](LICENSE)
