@@ -26,11 +26,23 @@
  * Anything that would put unauthorised traffic on the target belongs in the
  * operator's own tooling, which is why the dashboard exports wordlists instead
  * of firing them.
+ *
+ * ── Abuse controls ────────────────────────────────────────────────────────────
+ * Every request passes an origin check, a per-client window, a per-instance
+ * window and a concurrency cap before any network work happens. See
+ * `lib/passive-recon/rate-limit.ts` for why all four exist: hosted publicly,
+ * this endpoint runs OSINT lookups and target fetches from the *server's* IP on
+ * behalf of an anonymous caller, and an unmetered one is a free scanning proxy.
  */
 
 import type { NextRequest } from 'next/server';
 
 import { sanitizeDomain } from '@/lib/passive-recon/sanitize';
+import {
+  clientKey,
+  isAllowedOrigin,
+  scanGate,
+} from '@/lib/passive-recon/rate-limit';
 import { assertPublicHost } from '@/lib/passive-recon/net-guard';
 import {
   extractEndpoints,
@@ -1454,6 +1466,22 @@ function badRequest(error: string): Response {
 }
 
 /**
+ * One JSON line per lifecycle event, on stdout.
+ *
+ * A hosted deployment needs an answer to "who scanned what, when" — both to
+ * respond if the IP gets reported for abuse, and to see which client is
+ * burning the quota. Platform log collectors (Vercel, Docker, journald) all
+ * ingest stdout, so this needs no dependency. Note that `client` is an IP or
+ * an IPv6 /64, which is personal data in most jurisdictions: say so in your
+ * privacy notice and set a retention period.
+ */
+function audit(event: string, fields: Record<string, unknown>): void {
+  console.log(
+    JSON.stringify({ at: new Date().toISOString(), event, ...fields }),
+  );
+}
+
+/**
  * TypeScript cannot correlate a generic `K` with the distributed union member
  * it produces, so this one assertion is contained here rather than leaking an
  * `any` into every call site.
@@ -1467,6 +1495,23 @@ function doneEvent<K extends ModuleId>(
 }
 
 export async function POST(request: NextRequest): Promise<Response> {
+  const client = clientKey(request.headers);
+
+  // Gate 1: refuse cross-site browser requests. This does not stop curl — the
+  // rate limiter below is what applies there — but it stops another site
+  // driving scans from its visitors' browsers on this deployment's quota.
+  if (!isAllowedOrigin(request.headers.get('origin'), request.headers.get('host'))) {
+    audit('scan_rejected', { client, reason: 'cross_origin', status: 403 });
+    return Response.json(
+      {
+        error:
+          'Cross-site requests are not accepted. Use the dashboard on this origin, ' +
+          'or set PASSIVE_RECON_ALLOWED_ORIGINS if you front it with another host.',
+      },
+      { status: 403 },
+    );
+  }
+
   let body: unknown;
   try {
     body = await request.json();
@@ -1474,15 +1519,53 @@ export async function POST(request: NextRequest): Promise<Response> {
     return badRequest('Request body must be valid JSON.');
   }
 
+  // Gate 2: validate before metering, so a typo does not cost the caller a
+  // slot in their window. Sanitising is pure string work and costs nothing.
   const raw = (body as { domain?: unknown } | null)?.domain;
   const sanitized = sanitizeDomain(raw);
   if (!sanitized.ok) return badRequest(sanitized.error);
 
   const { domain } = sanitized;
 
-  // Second gate: the target must currently resolve to a public address.
-  const guard = await assertPublicHost(domain);
-  if (!guard.ok) return badRequest(guard.error);
+  // Gate 3: rate limit and concurrency. Everything past this point does real
+  // network work, so this is the last point at which refusing is free.
+  const decision = scanGate.admit(client);
+  if (!decision.ok) {
+    audit('scan_rejected', {
+      client,
+      domain,
+      reason: decision.status === 503 ? 'concurrency' : 'rate_limit',
+      status: decision.status,
+    });
+    return Response.json(
+      { error: decision.error },
+      {
+        status: decision.status,
+        headers: { 'Retry-After': String(decision.retryAfterSeconds) },
+      },
+    );
+  }
+
+  // From here on the slot is held and MUST be released on every exit path.
+  const { release } = decision;
+
+  // Gate 4: the target must currently resolve to a public address.
+  let guard;
+  try {
+    guard = await assertPublicHost(domain);
+  } catch (error) {
+    release();
+    audit('scan_rejected', { client, domain, reason: 'guard_error', status: 500 });
+    return Response.json({ error: toMessage(error) }, { status: 500 });
+  }
+
+  if (!guard.ok) {
+    release();
+    audit('scan_rejected', { client, domain, reason: 'non_public_target', status: 400 });
+    return badRequest(guard.error);
+  }
+
+  audit('scan_started', { client, domain, ...scanGate.stats() });
 
   const encoder = new TextEncoder();
 
@@ -1502,6 +1585,8 @@ export async function POST(request: NextRequest): Promise<Response> {
 
       const startedAt = Date.now();
       const signal = request.signal;
+      let succeeded = 0;
+      let failed = 0;
 
       try {
         send({
@@ -1529,8 +1614,10 @@ export async function POST(request: NextRequest): Promise<Response> {
           send({ type: 'module_start', module });
           try {
             const data = await task();
+            succeeded += 1;
             send(doneEvent(module, Date.now() - moduleStart, data));
           } catch (error) {
+            failed += 1;
             send({
               type: 'module_error',
               module,
@@ -1576,6 +1663,20 @@ export async function POST(request: NextRequest): Promise<Response> {
       } catch (error) {
         send({ type: 'scan_error', error: toMessage(error) });
       } finally {
+        // Releasing here rather than in `cancel` alone is what guarantees the
+        // slot comes back: a client disconnect aborts the module fetches, they
+        // settle, and this runs. `release` is idempotent, so `cancel` firing
+        // too is harmless.
+        release();
+        audit('scan_finished', {
+          client,
+          domain,
+          durationMs: Date.now() - startedAt,
+          modulesOk: succeeded,
+          modulesFailed: failed,
+          disconnected: closed,
+        });
+
         if (!closed) {
           try {
             controller.close();
@@ -1584,6 +1685,11 @@ export async function POST(request: NextRequest): Promise<Response> {
           }
         }
       }
+    },
+
+    /** Fires when the consumer goes away before the stream finishes. */
+    cancel() {
+      release();
     },
   });
 
