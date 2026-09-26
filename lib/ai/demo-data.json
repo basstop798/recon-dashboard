@@ -1,0 +1,86 @@
+{
+  "target": "acme-startup.example",
+  "note": "Demo findings for the AI Security Co-pilot. Shape matches lib/passive-recon/types.ts Finding[]. On build day, plan A replaces this with buildFindings() over a live BulletRecon scan; the deterministic demo set stays as the offline fallback so the 90-second demo can never break on a dead network.",
+  "findings": [
+    {
+      "id": "secret:AWS Access Key:AKIA****REDACTED****:app.bundle.js",
+      "module": "js-endpoints",
+      "severity": "critical",
+      "title": "AWS Access Key in client-side JavaScript",
+      "detail": "Pattern matched in a bundle served to every visitor. Confirm whether the value is live before reporting.",
+      "evidence": "AKIAIOSFODNN7EXAMPLE — https://acme-startup.example/static/app.bundle.js"
+    },
+    {
+      "id": "takeover:blog.acme-startup.example",
+      "module": "takeover",
+      "severity": "high",
+      "title": "Possible subdomain takeover: blog.acme-startup.example",
+      "detail": "The CNAME points at a known service that no longer claims this host, so an attacker could register it and serve content on your domain.",
+      "evidence": "blog.acme-startup.example CNAME acme-blog.herokudns.com"
+    },
+    {
+      "id": "mail:spf-permissive",
+      "module": "mail",
+      "severity": "high",
+      "title": "SPF allows any sender (+all)",
+      "detail": "The policy explicitly authorises every host on the internet to send as this domain.",
+      "evidence": "v=spf1 include:_spf.google.com +all"
+    },
+    {
+      "id": "header:Strict-Transport-Security",
+      "module": "tech",
+      "severity": "medium",
+      "title": "Missing Strict-Transport-Security",
+      "detail": "Without HSTS, a returning visitor can be downgraded to plain HTTP by a network attacker before the redirect to HTTPS happens.",
+      "evidence": "no Strict-Transport-Security header on https://acme-startup.example"
+    },
+    {
+      "id": "cookie:sessionid",
+      "module": "tech",
+      "severity": "medium",
+      "title": "Session-like cookie \"sessionid\" is missing flags",
+      "detail": "Set-Cookie for sessionid has no HttpOnly, no SameSite.",
+      "evidence": "sessionid served from 10.0.14.22 behind the load balancer"
+    },
+    {
+      "id": "mail:dmarc-none",
+      "module": "mail",
+      "severity": "medium",
+      "title": "DMARC policy is p=none",
+      "detail": "The domain monitors spoofing but instructs receivers to deliver it anyway.",
+      "evidence": "v=DMARC1; p=none; rua=mailto:dmarc@acme-startup.example"
+    },
+    {
+      "id": "js:sourcemaps",
+      "module": "js-endpoints",
+      "severity": "medium",
+      "title": "2 source maps referenced",
+      "detail": "Source maps usually reconstruct original, unminified source — including comments, internal paths and dead code.",
+      "evidence": "https://acme-startup.example/static/app.bundle.js.map\nhttps://acme-startup.example/static/vendor.bundle.js.map"
+    },
+    {
+      "id": "meta:robots-sensitive",
+      "module": "meta",
+      "severity": "low",
+      "title": "robots.txt names 3 sensitive-looking paths",
+      "detail": "Disallow entries are a curated list of what the operator would rather nobody visited — start there.",
+      "evidence": "/admin\n/internal/api\n/backup"
+    },
+    {
+      "id": "mail:caa-missing",
+      "module": "mail",
+      "severity": "low",
+      "title": "No CAA record",
+      "detail": "Any public CA may issue a certificate for this domain; CAA restricts that to named issuers.",
+      "evidence": "no CAA record for acme-startup.example"
+    },
+    {
+      "id": "whois:dnssec",
+      "module": "whois",
+      "severity": "info",
+      "title": "DNSSEC is not enabled",
+      "detail": "Responses for this zone are not signed, so cache-poisoning defences rely on transport alone.",
+      "evidence": "dnssec: unsigned"
+    }
+  ]
+}
