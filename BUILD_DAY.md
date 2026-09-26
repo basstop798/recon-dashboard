@@ -1,5 +1,10 @@
 # BUILD_DAY.md — AI Security Co-pilot, 27 September 2026
 
+> **UPDATE (26 Sep) — FAIR PLAY DECISION:** the hackathon project will be a **brand-new
+> repo coded on the day**, not built on BulletRecon. The A/B section below is obsolete.
+> The code in this repo is reference only; reuse only the plan, the knowledge-base data,
+> sample logs, the demo script and the project card. See `CLAUDE.md`.
+
 **One-line pitch:** *An AI security co-pilot for small businesses and startups in
 Africa that can't afford a security team — it turns raw recon findings into a
 ranked, plain-language report with cited, human-reviewed fixes.*
