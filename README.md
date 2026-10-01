@@ -79,14 +79,16 @@ npm run build           # Next.js production build
 Tests cover the four modules that gate what a public deployment is exposed
 to — `sanitizeDomain` (input validation), `net-guard` (the SSRF guard),
 `rate-limit` (abuse controls) and `proxy` (Basic auth) — at ~95%+ line
-coverage, plus the two modules that decide what the operator is actually
-told: `takeover` (subdomain-takeover fingerprinting) and `findings` (the
-triage feed the dashboard, the Markdown export and the JSON export all read).
-Those two are covered because a wrong answer costs more than a missing one,
-and most of their tests assert the negative case — that a hostname merely
-*containing* a provider's domain is not attributed to that provider, and that
-a path merely containing a keyword (`/blog/`, `/therapist/`) is not reported
-as sensitive. The remaining OSINT parsers and formatters have no tests yet. `.github/workflows/ci.yml` runs lint, tests and the build on every
+coverage, plus the three modules that decide what the operator is actually
+told: `takeover` (subdomain-takeover fingerprinting), `findings` (the triage
+feed the dashboard, the Markdown export and the JSON export all read) and
+`headers-audit` (the A–F grade and per-header advice). Those are covered
+because a wrong answer costs more than a missing one, and most of their tests
+assert the negative case — that a hostname merely *containing* a provider's
+domain is not attributed to that provider, that a path merely containing a
+keyword (`/blog/`, `/therapist/`) is not reported as sensitive, and that
+`'unsafe-inline'` on `style-src` does not make a CSP "weak" when `script-src`
+is locked down. The remaining OSINT parsers and formatters have no tests yet. `.github/workflows/ci.yml` runs lint, tests and the build on every
 push and pull request, on every branch.
 
 The scan pipeline itself lives across `app/api/passive-recon/route.ts` (the
