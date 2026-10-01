@@ -20,6 +20,43 @@ interface HeaderSpec {
 /** Six months, the value HSTS preload requires. */
 const HSTS_MIN_AGE = 15_552_000;
 
+/**
+ * Splits a CSP into its directives, lower-cased, first occurrence winning as
+ * the spec requires.
+ *
+ * Needed because the weakness checks must be scoped to the directive that
+ * governs scripts. Testing the whole policy string reported
+ * `style-src 'unsafe-inline'` as a weakened CSP even when `script-src 'self'`
+ * was locking scripts down properly — inline styles do not execute script,
+ * so that was an overstatement about a correctly configured site.
+ */
+function parseCspDirectives(value: string): Map<string, string> {
+  const directives = new Map<string, string>();
+
+  for (const part of value.split(';')) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+
+    const boundary = trimmed.search(/\s/);
+    const name = (boundary === -1 ? trimmed : trimmed.slice(0, boundary)).toLowerCase();
+    const directiveValue = boundary === -1 ? '' : trimmed.slice(boundary + 1).trim();
+
+    if (!directives.has(name)) directives.set(name, directiveValue);
+  }
+
+  return directives;
+}
+
+/**
+ * The source list that actually governs scripts: `script-src` when present,
+ * otherwise the `default-src` fallback. Null when neither is declared, so a
+ * caller can tell "no script constraint at all" from "constrained but weak".
+ */
+function effectiveScriptSrc(csp: string): string | null {
+  const directives = parseCspDirectives(csp);
+  return directives.get('script-src') ?? directives.get('default-src') ?? null;
+}
+
 const SPECS: readonly HeaderSpec[] = [
   {
     header: 'strict-transport-security',
@@ -44,10 +81,21 @@ const SPECS: readonly HeaderSpec[] = [
     severity: 'medium',
     advice: 'No CSP — nothing constrains where scripts may be loaded or sent from.',
     inspect: (value) => {
+      // Scoped to the directive that governs scripts, not the whole policy:
+      // 'unsafe-inline' on style-src does not let an attacker run code.
+      const scriptSrc = effectiveScriptSrc(value);
+      if (scriptSrc === null) {
+        return {
+          severity: 'low',
+          advice: 'CSP present but declares neither script-src nor default-src, so scripts are unconstrained.',
+        };
+      }
+
       const problems: string[] = [];
-      if (/'unsafe-inline'/i.test(value)) problems.push("'unsafe-inline'");
-      if (/'unsafe-eval'/i.test(value)) problems.push("'unsafe-eval'");
-      if (/(?:default|script)-src[^;]*\*(?!\.)/i.test(value)) problems.push('wildcard script source');
+      if (/'unsafe-inline'/i.test(scriptSrc)) problems.push("'unsafe-inline'");
+      if (/'unsafe-eval'/i.test(scriptSrc)) problems.push("'unsafe-eval'");
+      // A bare `*` source, not the wildcard host in `https://*.cdn.example`.
+      if (/(?<![\w.-])\*(?![\w.-])/.test(scriptSrc)) problems.push('wildcard script source');
 
       return problems.length > 0
         ? {
@@ -239,27 +287,41 @@ function metaContent(html: string, pattern: RegExp): string | null {
   return match?.[1]?.trim().slice(0, 300) || null;
 }
 
+/**
+ * Reads the `content` of the first `<meta>` tag whose `name`/`property`
+ * matches, in whatever order the attributes appear.
+ *
+ * The previous single-regex approach required `name` before `content`, so
+ * `<meta content="..." name="description">` — valid HTML that real pages
+ * emit — produced null. Reporting a page as having no description when it has
+ * one is the same class of error as inventing one.
+ */
+function metaByKey(html: string, attribute: 'name' | 'property', key: string): string | null {
+  const tags = html.match(/<meta\b[^>]*>/gi) ?? [];
+  const keyPattern = new RegExp(`\\b${attribute}\\s*=\\s*["']${key}["']`, 'i');
+
+  for (const tag of tags) {
+    if (!keyPattern.test(tag)) continue;
+    const content = tag.match(/\bcontent\s*=\s*["']([^"']*)["']/i)?.[1];
+    const trimmed = content?.trim().slice(0, 300);
+    if (trimmed) return trimmed;
+  }
+
+  return null;
+}
+
 /** Pulls the page's own description of itself out of the returned markup. */
 export function parsePageIdentity(html: string): PageIdentity {
   return {
-    title: metaContent(html, /<title[^>]*>([\s\S]{0,300}?)<\/title>/i),
+    // Unbounded capture, then truncated by metaContent. A {0,300} capture
+    // made the match FAIL on a longer title rather than truncate it, so a
+    // page with a 400-character title was reported as having none.
+    title: metaContent(html, /<title[^>]*>([\s\S]*?)<\/title>/i),
     description:
-      metaContent(
-        html,
-        /<meta[^>]+name=["']description["'][^>]+content=["']([^"']*)["']/i,
-      ) ??
-      metaContent(
-        html,
-        /<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']*)["']/i,
-      ),
-    generator: metaContent(
-      html,
-      /<meta[^>]+name=["']generator["'][^>]+content=["']([^"']*)["']/i,
-    ),
-    ogImage: metaContent(
-      html,
-      /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']*)["']/i,
-    ),
+      metaByKey(html, 'name', 'description') ??
+      metaByKey(html, 'property', 'og:description'),
+    generator: metaByKey(html, 'name', 'generator'),
+    ogImage: metaByKey(html, 'property', 'og:image'),
     lang: metaContent(html, /<html[^>]+lang=["']([^"']{2,15})["']/i),
   };
 }
