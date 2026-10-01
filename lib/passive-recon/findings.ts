@@ -40,13 +40,39 @@ const VERIFICATION_TOKENS: ReadonlyArray<{ pattern: RegExp; vendor: string }> = 
   { pattern: /^mailru-verification|^yandex-verification/i, vendor: 'Mail.ru / Yandex' },
 ];
 
-/** robots.txt paths that are worth a look precisely because they are hidden. */
-const SENSITIVE_ROBOTS_RE =
-  /admin|internal|private|backup|config|api|graphql|debug|test|staging|dev|secret|token|upload|export|download|\.git|\.env|db|sql|log/i;
+/**
+ * robots.txt paths worth a look precisely because they are hidden.
+ *
+ * Two tiers, because one substring regex produced constant false positives:
+ * `log` matched /blog/ and /catalogue/, `api` matched /therapist/, and `db`
+ * matched /feedback/ and /oldbooks/. Those paths are in most robots.txt
+ * files, so the one finding meant to say "start here" pointed at a blog on
+ * nearly every scan — the fastest way to teach an operator to ignore it.
+ */
+// Distinctive enough to match anywhere: these do not occur inside ordinary
+// English path words.
+const SENSITIVE_PATH_WORDS =
+  /admin|internal|private|backup|config|graphql|debug|staging|secret|token|upload|export|download|\.git|\.env/i;
 
-/** Cookie names that almost certainly carry a session. */
+// Short and ambiguous, so each must stand alone as a word: /api/ and
+// /api-docs/ qualify, /therapist/ does not.
+const SENSITIVE_PATH_TOKENS = /(?<![a-z0-9])(api|dbs?|logs?|dev|tests?|sql)(?![a-z0-9])/i;
+
+function isSensitivePath(path: string): boolean {
+  return SENSITIVE_PATH_WORDS.test(path) || SENSITIVE_PATH_TOKENS.test(path);
+}
+
+/**
+ * Cookie names that almost certainly carry a session.
+ *
+ * The lookarounds exclude the two collisions this produced in practice:
+ * `assessment_id` matched `sess` and `author_pref` matched `auth`, and both
+ * were then reported as a session cookie missing flags at medium severity.
+ * Embedded markers still match, because real session cookies carry them
+ * mid-name (PHPSESSID, JSESSIONID), and `authorization` is still matched.
+ */
 const SESSION_COOKIE_RE =
-  /sess|sid$|^sid|auth|token|jwt|login|remember|csrf|xsrf/i;
+  /(?<!as)sess|sid$|^sid|auth(?!ors?(?:[_\-.]|$))|token|jwt|login|remember|csrf|xsrf/i;
 
 const DAY_MS = 86_400_000;
 
@@ -290,7 +316,7 @@ export function buildFindings(report: ScanReport): Finding[] {
 
   const meta = report.modules.meta.data;
   if (meta) {
-    const sensitive = meta.robots.disallowed.filter((path) => SENSITIVE_ROBOTS_RE.test(path));
+    const sensitive = meta.robots.disallowed.filter(isSensitivePath);
     if (sensitive.length > 0) {
       push({
         id: 'meta:robots-sensitive',
@@ -338,10 +364,15 @@ export function buildFindings(report: ScanReport): Finding[] {
           id: 'whois:expiring',
           module: 'whois',
           severity: days <= 0 ? 'high' : 'medium',
+          // days === 0 means it lapses today, which is urgent but has not
+          // happened yet; reporting that as "has expired" states something
+          // the scan did not observe.
           title:
-            days <= 0
+            days < 0
               ? 'Domain registration has expired'
-              : `Domain expires in ${days} day${days === 1 ? '' : 's'}`,
+              : days === 0
+                ? 'Domain registration expires today'
+                : `Domain expires in ${days} day${days === 1 ? '' : 's'}`,
           detail: 'An expiring registration is a hijack window; report it before somebody else registers it.',
           evidence: whois.domain.expiresAt,
         });

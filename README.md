@@ -79,12 +79,14 @@ npm run build           # Next.js production build
 Tests cover the four modules that gate what a public deployment is exposed
 to — `sanitizeDomain` (input validation), `net-guard` (the SSRF guard),
 `rate-limit` (abuse controls) and `proxy` (Basic auth) — at ~95%+ line
-coverage, plus `takeover` (subdomain-takeover fingerprinting), the first
-module that produces an *answer* rather than guarding an input. Takeover is
-covered because it decides a `high`-severity verdict an operator would file
-with a programme, and most of its tests assert the negative case: that a
-hostname merely *containing* a provider's domain is not attributed to that
-provider. The remaining OSINT parsers and formatters have no tests yet. `.github/workflows/ci.yml` runs lint, tests and the build on every
+coverage, plus the two modules that decide what the operator is actually
+told: `takeover` (subdomain-takeover fingerprinting) and `findings` (the
+triage feed the dashboard, the Markdown export and the JSON export all read).
+Those two are covered because a wrong answer costs more than a missing one,
+and most of their tests assert the negative case — that a hostname merely
+*containing* a provider's domain is not attributed to that provider, and that
+a path merely containing a keyword (`/blog/`, `/therapist/`) is not reported
+as sensitive. The remaining OSINT parsers and formatters have no tests yet. `.github/workflows/ci.yml` runs lint, tests and the build on every
 push and pull request, on every branch.
 
 The scan pipeline itself lives across `app/api/passive-recon/route.ts` (the
