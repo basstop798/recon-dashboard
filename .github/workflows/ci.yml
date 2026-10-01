@@ -1,10 +1,11 @@
 name: CI
 
 on:
+  # Every branch, not just master. A gate that only runs on master cannot
+  # protect work in progress: feat/ai-copilot sat for days with no CI run at
+  # all, so "the tests are green" was a claim nobody could audit.
   push:
-    branches: [master]
   pull_request:
-    branches: [master]
 
 # Cancel superseded runs on the same branch/PR so pushes don't queue behind
 # stale checks.

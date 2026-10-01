@@ -80,7 +80,7 @@ Tests currently cover the four modules that gate what a public deployment is
 exposed to — `sanitizeDomain` (input validation), `net-guard` (the SSRF guard),
 `rate-limit` (abuse controls) and `proxy` (Basic auth) — at ~95%+ line
 coverage. `.github/workflows/ci.yml` runs lint, tests and the build on every
-push and pull request against `master`.
+push and pull request, on every branch.
 
 The scan pipeline itself lives across `app/api/passive-recon/route.ts` (the
 orchestrator: gates, the NDJSON event stream, and wiring shared work — the one
