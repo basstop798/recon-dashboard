@@ -76,10 +76,15 @@ npm run test:coverage  # Vitest with a v8 coverage report
 npm run build           # Next.js production build
 ```
 
-Tests currently cover the four modules that gate what a public deployment is
-exposed to — `sanitizeDomain` (input validation), `net-guard` (the SSRF guard),
+Tests cover the four modules that gate what a public deployment is exposed
+to — `sanitizeDomain` (input validation), `net-guard` (the SSRF guard),
 `rate-limit` (abuse controls) and `proxy` (Basic auth) — at ~95%+ line
-coverage. `.github/workflows/ci.yml` runs lint, tests and the build on every
+coverage, plus `takeover` (subdomain-takeover fingerprinting), the first
+module that produces an *answer* rather than guarding an input. Takeover is
+covered because it decides a `high`-severity verdict an operator would file
+with a programme, and most of its tests assert the negative case: that a
+hostname merely *containing* a provider's domain is not attributed to that
+provider. The remaining OSINT parsers and formatters have no tests yet. `.github/workflows/ci.yml` runs lint, tests and the build on every
 push and pull request, on every branch.
 
 The scan pipeline itself lives across `app/api/passive-recon/route.ts` (the
