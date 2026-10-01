@@ -17,8 +17,28 @@ export type TakeoverStatus = 'confirmed' | 'edge-case' | 'not-vulnerable';
 
 export interface TakeoverFingerprint {
   service: string;
-  /** Matched as a CNAME suffix, case-insensitively. */
+  /**
+   * Provider domains, matched against the END of the CNAME target at a label
+   * boundary, case-insensitively.
+   *
+   * Identification must be by suffix and nothing else: whoever owns the last
+   * labels of a hostname owns the hostname. `github.io.attacker.com` belongs
+   * to attacker.com, not to GitHub, so a substring test anywhere in the
+   * target is not an identification — it is a false positive waiting to be
+   * filed as a bug report.
+   */
   suffixes: readonly string[];
+  /**
+   * Optional refinement for providers that share an apex with sibling
+   * services. When set, at least one label of the target must equal a marker
+   * or start with `<marker>-`, IN ADDITION to an anchored suffix match.
+   *
+   * AWS needs this: every S3 endpoint ends in `amazonaws.com`, which EC2 and
+   * the other services use too, so S3 is "amazonaws.com carrying an s3
+   * label" — `bucket.s3.us-east-1.amazonaws.com`,
+   * `bucket.s3-website-us-east-1.amazonaws.com`.
+   */
+  labelMarkers?: readonly string[];
   status: TakeoverStatus;
   note: string;
 }
@@ -26,7 +46,13 @@ export interface TakeoverFingerprint {
 export const TAKEOVER_FINGERPRINTS: readonly TakeoverFingerprint[] = [
   {
     service: 'AWS S3',
-    suffixes: ['s3.amazonaws.com', 's3-website', '.s3.'],
+    // Anchored on the AWS apex and narrowed by an s3 label, which covers the
+    // global, regional and website endpoint forms. The previous patterns
+    // included the bare fragments 's3-website' and '.s3.', which matched any
+    // hostname containing them — `cdn.s3.mycompany.internal` was reported as
+    // a confirmed AWS S3 takeover.
+    suffixes: ['amazonaws.com'],
+    labelMarkers: ['s3'],
     status: 'confirmed',
     note: 'A released bucket name can be re-created by anyone in the same region.',
   },
@@ -317,16 +343,46 @@ export const TAKEOVER_FINGERPRINTS: readonly TakeoverFingerprint[] = [
   },
 ];
 
-/** Matches a CNAME target against the fingerprint catalogue. */
+/** True when `suffix` owns the end of `target`, aligned to a label boundary. */
+function matchesSuffix(target: string, suffix: string): boolean {
+  const s = suffix.toLowerCase().replace(/^\.+|\.+$/g, '');
+  if (!s) return false;
+  return target === s || target.endsWith(`.${s}`);
+}
+
+/** True when any label of `target` equals a marker or starts with `<marker>-`. */
+function matchesLabelMarkers(target: string, markers: readonly string[]): boolean {
+  const labels = target.split('.');
+  return markers.some((marker) => {
+    const m = marker.toLowerCase();
+    return labels.some((label) => label === m || label.startsWith(`${m}-`));
+  });
+}
+
+/**
+ * Matches a CNAME target against the fingerprint catalogue.
+ *
+ * Matching is ANCHORED: the provider must own the end of the hostname. The
+ * previous implementation also accepted `target.includes(suffix)`, which
+ * identified a provider from a substring appearing anywhere, so a CNAME to
+ * `github.io.attacker-controlled.com` was reported as a confirmed GitHub
+ * Pages takeover at `high` severity. The target of that CNAME is owned by
+ * `attacker-controlled.com`; GitHub has nothing to do with it. Filing that as
+ * a finding is how a bug-bounty account loses its reputation.
+ */
 export function fingerprintCname(cname: string): TakeoverFingerprint | null {
-  const target = cname.toLowerCase().replace(/\.+$/, '');
+  const target = cname.trim().toLowerCase().replace(/\.+$/, '');
+  if (!target) return null;
 
   for (const fingerprint of TAKEOVER_FINGERPRINTS) {
-    for (const suffix of fingerprint.suffixes) {
-      if (target === suffix || target.endsWith(`.${suffix}`) || target.includes(suffix)) {
-        return fingerprint;
-      }
+    if (!fingerprint.suffixes.some((suffix) => matchesSuffix(target, suffix))) continue;
+    // A shared apex (e.g. amazonaws.com) only identifies this service when
+    // the service's own label is present; otherwise keep looking, so a
+    // sibling service's fingerprint can still match.
+    if (fingerprint.labelMarkers && !matchesLabelMarkers(target, fingerprint.labelMarkers)) {
+      continue;
     }
+    return fingerprint;
   }
 
   return null;
